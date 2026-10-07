@@ -3,96 +3,305 @@ import socketserver
 import json
 import csv
 import io
+import os
+import time
+import threading
 import requests as http_requests
 from obswebsocket import obsws, requests as obs_requests
 
 # -------------------------------------------------------------
 # 1. 設定項目
 # -------------------------------------------------------------
-SHEET_CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vSVZ8pEwfQqdHHmyZu8V4fkVxVodYUqUj68R4cQiNgrjfqwp2l3SQNhA-yyW30bj5ebEjE8CJOEdf7a/pub?gid=0&single=true&output=csv"
+# スプレッドシート各CSV URL
+SHEET_TIMETABLE_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vSVZ8pEwfQqdHHmyZu8V4fkVxVodYUqUj68R4cQiNgrjfqwp2l3SQNhA-yyW30bj5ebEjE8CJOEdf7a/pub?gid=0&single=true&output=csv"
+SHEET_CM_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vSVZ8pEwfQqdHHmyZu8V4fkVxVodYUqUj68R4cQiNgrjfqwp2l3SQNhA-yyW30bj5ebEjE8CJOEdf7a/pub?gid=1625346547&single=true&output=csv"
+SHEET_INFO_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vSVZ8pEwfQqdHHmyZu8V4fkVxVodYUqUj68R4cQiNgrjfqwp2l3SQNhA-yyW30bj5ebEjE8CJOEdf7a/pub?gid=1920382146&single=true&output=csv"
 
+# Gemini API (Cloudflare Workers)
+AI_API_URL = "https://shikosai-signage-api.kobot0526.workers.dev/api/format"
+
+# OBS接続設定
 OBS_HOST = "localhost"
 OBS_PORT = 4455
-OBS_PASSWORD = ""
+OBS_PASSWORD = "GzQNnOZxEzEQQ5iI"  # ★ここにOBSのパスワードを入力してください
 
+# ソース名・シーン名
 SCENE_MAIN = "シーン"
-SCENE_SUB = "シーン 2"
-TEXT_SOURCE = "テキスト (FreeType 2)"
+SOURCE_STAGE = "ステージ映像"
+SOURCE_CM = "CM映像"
+TEXT_SOURCE_SONG = "telop"  # 曲名テロップソース名
+TEXT_SOURCE_INFO = "infomation"             # AI情報テロップソース名
+FILTER_SCROLL = "スクロール"                # infomationに追加したフィルタ名
+
+DEFAULT_CM_FILE_PATH = "C:/path/to/your_cm_video.mp4"
 WEB_PORT = 8080
 
+# テロップ表示枠の目安文字数（これ以下ならスクロールせず6秒表示）
+MAX_STATIC_CHARS = 24
+
 # -------------------------------------------------------------
-# 2. OBS接続
+# 2. OBS接続 & 初期設定
 # -------------------------------------------------------------
 ws = obsws(OBS_HOST, OBS_PORT, OBS_PASSWORD)
 ws.connect()
 print("=== OBSに接続しました ===")
 
-res = ws.call(obs_requests.GetSceneItemId(sceneName=SCENE_MAIN, sourceName=TEXT_SOURCE))
-item_id = res.getSceneItemId()
-
-# -------------------------------------------------------------
-# 3. タイムテーブル管理
-# -------------------------------------------------------------
-class State:
-    timetable = []
-    current_index = -1  # -1 は開始前（待機状態）
-
-state = State()
-
-def fetch_timetable():
+def get_item_id(scene_name, source_name):
     try:
-        res = http_requests.get(SHEET_CSV_URL, timeout=5)
-        res.encoding = "utf-8"
-        res.raise_for_status()
-        
-        csv_file = io.StringIO(res.text)
-        reader = csv.DictReader(csv_file)
-        
-        # タイトルが入っている有効な行のみ抽出
-        table = [row for row in reader if row.get("title") and row["title"].strip()]
-        state.timetable = table
-        print(f"スプレッドシートから {len(state.timetable)} 件の演目を読み込みました。")
+        res = ws.call(obs_requests.GetSceneItemId(sceneName=scene_name, sourceName=source_name))
+        return res.getSceneItemId()
     except Exception as e:
-        print(f"スプレッドシート読み込みエラー: {e}")
+        print(f"警告: ソース '{source_name}' のID取得失敗: {e}")
+        return None
 
-fetch_timetable()
+id_text_song = get_item_id(SCENE_MAIN, TEXT_SOURCE_SONG)
+id_text_info = get_item_id(SCENE_MAIN, TEXT_SOURCE_INFO)
+id_stage = get_item_id(SCENE_MAIN, SOURCE_STAGE)
+id_cm = get_item_id(SCENE_MAIN, SOURCE_CM)
+
+def set_source_visible(scene_name, item_id, visible):
+    if item_id is not None:
+        ws.call(obs_requests.SetSceneItemEnabled(
+            sceneName=scene_name,
+            sceneItemId=item_id,
+            sceneItemEnabled=visible
+        ))
+
+def update_text_source(source_name, text):
+    ws.call(obs_requests.SetInputSettings(
+        inputName=source_name,
+        inputSettings={"text": text}
+    ))
+
+def set_scroll_speed(source_name, speed):
+    """スクロールフィルタの水平速度を設定（0で停止）"""
+    try:
+        ws.call(obs_requests.SetSourceFilterSettings(
+            sourceName=source_name,
+            filterName=FILTER_SCROLL,
+            filterSettings={"speed_x": speed}
+        ))
+    except Exception as e:
+        pass
+
+# -------------------------------------------------------------
+# 3. AI整形 & データ管理
+# -------------------------------------------------------------
+def format_with_ai(raw_text):
+    try:
+        res = http_requests.post(AI_API_URL, json={"text": raw_text}, timeout=8)
+        res.raise_for_status()
+        data = res.json()
+        formatted = data.get("formatted_text", raw_text)
+        print(f"[AI整形] {raw_text} -> {formatted}")
+        return formatted
+    except Exception as e:
+        print(f"[AI整形エラー（生テキスト使用）]: {e}")
+        return raw_text
+
+class AppData:
+    timetable = []
+    cm_list = []
+    info_list = []
+    current_index = -1
+
+data = AppData()
+
+def fetch_all_sheets():
+    # 1. タイムテーブル
+    try:
+        res = http_requests.get(SHEET_TIMETABLE_URL, timeout=5)
+        res.encoding = "utf-8"
+        reader = csv.DictReader(io.StringIO(res.text))
+        data.timetable = [r for r in reader if r.get("title") and r["title"].strip()]
+        print(f"タイムテーブル: {len(data.timetable)}件 取得")
+    except Exception as e:
+        print(f"タイムテーブル取得失敗: {e}")
+
+    # 2. CM等
+    try:
+        res = http_requests.get(SHEET_CM_URL, timeout=5)
+        res.encoding = "utf-8"
+        reader = csv.DictReader(io.StringIO(res.text))
+        data.cm_list = [r for r in reader if str(r.get("is_active", "")).strip().upper() == "TRUE"]
+        print(f"CMリスト(有効): {len(data.cm_list)}件 取得")
+    except Exception as e:
+        print(f"CMリスト取得失敗: {e}")
+
+    # 3. 下側情報欄（AI要約用）
+    try:
+        res = http_requests.get(SHEET_INFO_URL, timeout=5)
+        res.encoding = "utf-8"
+        reader = csv.DictReader(io.StringIO(res.text))
+        active_infos = []
+        for r in reader:
+            if str(r.get("is_active", "")).strip().upper() == "TRUE" and r.get("raw_text"):
+                active_infos.append(r)
+        data.info_list = active_infos
+        print(f"下側情報欄(有効): {len(data.info_list)}件 取得")
+    except Exception as e:
+        print(f"下側情報欄取得失敗: {e}")
+
+fetch_all_sheets()
+
+# -------------------------------------------------------------
+# スプレッドシート常時自動更新ループ（バックグラウンド監視）
+# -------------------------------------------------------------
+AUTO_SYNC_INTERVAL = 20  # 自動更新の間隔（秒）
+
+def auto_sheet_sync_loop():
+    while True:
+        time.sleep(AUTO_SYNC_INTERVAL)
+        try:
+            # 最新のデータを再取得
+            fetch_all_sheets()
+            # 案内文が変わった場合に備えて古いキャッシュをクリア
+            info_text_cache.clear()
+        except Exception as e:
+            print(f"自動シート同期エラー: {e}")
+
+# 自動更新スレッドを起動
+sync_thread = threading.Thread(target=auto_sheet_sync_loop, daemon=True)
+sync_thread.start()
+
+# -------------------------------------------------------------
+# 4. 下側テロップ 自動スクロール循環ループ（常時スレッド）
+# -------------------------------------------------------------
+info_text_cache = {}  # AIの重複リクエストを防ぐキャッシュ
+
+def ticker_loop():
+    set_source_visible(SCENE_MAIN, id_text_info, True)
+    curr_idx = 0
+
+    while True:
+        if not data.info_list:
+            time.sleep(3)
+            continue
+
+        item = data.info_list[curr_idx % len(data.info_list)]
+        raw_text = item.get("raw_text", "").strip()
+
+        if not raw_text:
+            curr_idx += 1
+            time.sleep(1)
+            continue
+
+        # AIで要約（キャッシュがあれば再利用）
+        if raw_text not in info_text_cache:
+            info_text_cache[raw_text] = format_with_ai(raw_text)
+        display_text = info_text_cache[raw_text]
+
+        # 1. 速度0でテキスト更新
+        set_scroll_speed(TEXT_SOURCE_INFO, 0)
+        update_text_source(TEXT_SOURCE_INFO, display_text)
+
+        # 2. 短い文か長い文かで挙動を分岐
+        if len(display_text) <= MAX_STATIC_CHARS:
+            # 全文収まる場合はスクロールなしで6秒表示
+            time.sleep(5.0)
+        else:
+            # 収まらない場合は、まず2秒静止
+            time.sleep(1.0)
+            
+            # スクロール開始（速度85）
+            SCROLL_SPEED = 85
+            set_scroll_speed(TEXT_SOURCE_INFO, SCROLL_SPEED)
+            
+            # 文字長さに応じたスクロール計算時間（1文字あたり約0.35秒）
+            scroll_duration = max(3.0, (len(display_text) - MAX_STATIC_CHARS) * 0.35)
+            time.sleep(scroll_duration)
+
+            # 文末が表示されたら停止して3秒待機
+            set_scroll_speed(TEXT_SOURCE_INFO, 0)
+            time.sleep(1.0)
+
+        curr_idx += 1
+
+# スクロールループを別スレッドで開始
+ticker_thread = threading.Thread(target=ticker_loop, daemon=True)
+ticker_thread.start()
+
+# -------------------------------------------------------------
+# 5. ステージ進行・CM切り替えロジック
+# -------------------------------------------------------------
+cm_index = 0
+is_in_break = False
+cm_timer_thread = None
+
+def play_next_cm():
+    """次のCM動画を再生する"""
+    global cm_index
+    if not data.cm_list:
+        return
+
+    cm_item = data.cm_list[cm_index % len(data.cm_list)]
+    cm_path = cm_item.get("file_path", "").strip()
+    cm_index += 1
+
+    if cm_path and os.path.exists(cm_path):
+        ws.call(obs_requests.SetInputSettings(
+            inputName=SOURCE_CM,
+            inputSettings={"local_file": cm_path, "looping": False}
+        ))
+        try:
+            ws.call(obs_requests.TriggerMediaInputAction(
+                inputName=SOURCE_CM,
+                mediaAction="OBS_WEBSOCKET_MEDIA_INPUT_ACTION_RESTART"
+            ))
+        except Exception:
+            pass
+        print(f"CM再生開始: {os.path.basename(cm_path)}")
+
+def cm_rotation_loop():
+    """break中にCMを定期的に次へ切り替えるループ"""
+    while is_in_break:
+        play_next_cm()
+        for _ in range(15):
+            if not is_in_break:
+                break
+            time.sleep(1)
 
 def apply_obs_by_index(idx):
-    """指定したインデックスの演目をOBSに反映する"""
-    if idx < 0 or idx >= len(state.timetable):
+    global is_in_break, cm_timer_thread
+    if idx < 0 or idx >= len(data.timetable):
         return "範囲外です"
-    
-    item = state.timetable[idx]
+
+    item = data.timetable[idx]
+
     if item["type"] == "song":
-        # メインシーンに戻してテロップを表示
-        ws.call(obs_requests.SetCurrentProgramScene(sceneName=SCENE_MAIN))
-        display_text = f"♪ {item['title']}"
+        is_in_break = False
+        
+        # ステージ映像ON / CM映像OFF
+        set_source_visible(SCENE_MAIN, id_stage, True)
+        set_source_visible(SCENE_MAIN, id_cm, False)
+
+        # 曲名テロップ表示
+        display_song = f"♪ {item['title']}"
         if item.get("band"):
-            display_text += f" / {item['band']}"
-        
-        ws.call(obs_requests.SetInputSettings(
-            inputName=TEXT_SOURCE,
-            inputSettings={"text": display_text}
-        ))
-        ws.call(obs_requests.SetSceneItemEnabled(
-            sceneName=SCENE_MAIN,
-            sceneItemId=item_id,
-            sceneItemEnabled=True
-        ))
-        return f"テロップ表示: {display_text}"
-        
+            display_song += f" / {item['band']}"
+        update_text_source(TEXT_SOURCE_SONG, display_song)
+        set_source_visible(SCENE_MAIN, id_text_song, True)
+
+        return f"【曲】ステージ映像 & 曲テロップ: {display_song}"
+
     elif item["type"] == "break":
-        # テロップを非表示にして幕間シーンへ切替
-        ws.call(obs_requests.SetSceneItemEnabled(
-            sceneName=SCENE_MAIN,
-            sceneItemId=item_id,
-            sceneItemEnabled=False
-        ))
-        ws.call(obs_requests.SetCurrentProgramScene(sceneName=SCENE_SUB))
-        return f"画面切替: 幕間画面 ({item['title']})"
+        # 曲名テロップ非表示
+        set_source_visible(SCENE_MAIN, id_text_song, False)
+
+        # ステージ映像OFF / CM映像ON
+        set_source_visible(SCENE_MAIN, id_stage, False)
+        set_source_visible(SCENE_MAIN, id_cm, True)
+
+        # CMローテーションループを開始
+        if not is_in_break:
+            is_in_break = True
+            cm_timer_thread = threading.Thread(target=cm_rotation_loop, daemon=True)
+            cm_timer_thread.start()
+
+        return f"【幕間】CM再生開始 ({item['title']})"
 
 # -------------------------------------------------------------
-# 4. 操作用Web画面（HTML）
+# 6. Webコントローラー画面 & サーバー起動
 # -------------------------------------------------------------
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="ja">
@@ -104,43 +313,32 @@ HTML_PAGE = """<!DOCTYPE html>
     * { box-sizing: border-box; }
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #f8fafc; margin: 0; padding: 16px; }
     .container { max-width: 600px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; }
-    
     .card { background: #1e293b; padding: 20px; border-radius: 16px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.3); }
     .section-label { font-size: 13px; font-weight: bold; color: #94a3b8; text-transform: uppercase; margin-bottom: 6px; letter-spacing: 0.05em; }
-    
-    /* 前・現在・次のカード */
     .slot { padding: 12px; border-radius: 10px; margin-bottom: 8px; }
     .slot-prev { background: #0f172a; border-left: 4px solid #64748b; opacity: 0.75; }
     .slot-current { background: #0284c7; border-left: 6px solid #38bdf8; padding: 16px; box-shadow: 0 4px 12px rgba(2, 132, 199, 0.4); }
     .slot-next { background: #0f172a; border-left: 4px solid #3b82f6; }
-    
     .slot-title { font-size: 18px; font-weight: bold; }
     .slot-current .slot-title { font-size: 22px; }
     .slot-sub { font-size: 14px; color: #cbd5e1; margin-top: 4px; }
-    
-    /* コントロールボタン */
     .btn-row { display: flex; gap: 12px; margin-top: 12px; }
     .btn { flex: 1; padding: 18px; font-size: 18px; font-weight: bold; border: none; border-radius: 12px; cursor: pointer; color: white; transition: 0.1s; }
     .btn:active { transform: scale(0.97); }
     .btn-prev { background: #475569; }
     .btn-next { background: #2563eb; flex: 2; }
     .btn-sync { width: 100%; background: #334155; font-size: 14px; padding: 10px; margin-top: 8px; border: none; border-radius: 8px; color: #94a3b8; cursor: pointer; }
-    
-    /* 演目一覧リスト */
     .timetable-list { max-height: 240px; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
     .list-item { display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; border-radius: 8px; background: #0f172a; font-size: 14px; }
     .list-item.active { background: #0369a1; border-left: 4px solid #38bdf8; font-weight: bold; }
     .tag { font-size: 11px; padding: 2px 6px; border-radius: 4px; }
     .tag-song { background: #166534; color: #bbf7d0; }
     .tag-break { background: #854d0e; color: #fef08a; }
-
     #status-msg { text-align: center; font-size: 13px; color: #38bdf8; min-height: 18px; margin-top: 8px; }
   </style>
 </head>
 <body>
   <div class="container">
-    
-    <!-- 進行モニター（前・現在・次） -->
     <div class="card">
       <div class="slot slot-prev">
         <div class="section-label">◀ 1つ前の演目</div>
@@ -160,21 +358,18 @@ HTML_PAGE = """<!DOCTYPE html>
         <div id="next-sub" class="slot-sub"></div>
       </div>
 
-      <!-- 操作ボタン -->
       <div class="btn-row">
         <button class="btn btn-prev" onclick="sendAction('prev')">◀ 前へ戻る</button>
         <button class="btn btn-next" onclick="sendAction('next')">次へ進む ▶</button>
       </div>
-      <button class="btn-sync" onclick="sendAction('sync')">↻ スプレッドシート再同期</button>
+      <button class="btn-sync" onclick="sendAction('sync')">↻ 全スプレッドシート再同期</button>
       <div id="status-msg"></div>
     </div>
 
-    <!-- 演目一覧 -->
     <div class="card">
       <div class="section-label">全演目リスト</div>
       <div id="timetable-list" class="timetable-list"></div>
     </div>
-
   </div>
 
   <script>
@@ -191,26 +386,24 @@ HTML_PAGE = """<!DOCTYPE html>
 
     async function updateUI() {
       const res = await fetch('/api/state');
-      const data = await res.json();
+      const d = await res.json();
       
-      // 前・現在・次の描画
-      renderSlot('prev-title', 'prev-sub', data.prev);
+      renderSlot('prev-title', 'prev-sub', d.prev);
       
-      if (data.current) {
-        renderSlot('curr-title', 'curr-sub', data.current);
+      if (d.current) {
+        renderSlot('curr-title', 'curr-sub', d.current);
       } else {
-        document.getElementById('curr-title').innerText = data.currentIndex < 0 ? '待機中（未開始）' : '全スケジュール終了';
-        document.getElementById('curr-sub').innerText = data.currentIndex < 0 ? '「次へ進む」で開始' : '';
+        document.getElementById('curr-title').innerText = d.currentIndex < 0 ? '待機中（未開始）' : '全スケジュール終了';
+        document.getElementById('curr-sub').innerText = d.currentIndex < 0 ? '「次へ進む」で開始' : '';
       }
 
-      renderSlot('next-title', 'next-sub', data.next);
+      renderSlot('next-title', 'next-sub', d.next);
 
-      // リストの描画
       const listEl = document.getElementById('timetable-list');
       listEl.innerHTML = '';
-      data.timetable.forEach((item, idx) => {
+      d.timetable.forEach((item, idx) => {
         const itemDiv = document.createElement('div');
-        itemDiv.className = 'list-item' + (idx === data.currentIndex ? ' active' : '');
+        itemDiv.className = 'list-item' + (idx === d.currentIndex ? ' active' : '');
         
         const tagClass = item.type === 'song' ? 'tag-song' : 'tag-break';
         const tagText = item.type === 'song' ? '曲' : '幕間';
@@ -234,21 +427,17 @@ HTML_PAGE = """<!DOCTYPE html>
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action })
       });
-      const data = await res.json();
-      document.getElementById('status-msg').innerText = data.message;
+      const d = await res.json();
+      document.getElementById('status-msg').innerText = d.message;
       updateUI();
     }
 
-    // 初回描画
     updateUI();
   </script>
 </body>
 </html>
 """
 
-# -------------------------------------------------------------
-# 5. リクエスト処理ハンドラ
-# -------------------------------------------------------------
 class RequestHandler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/":
@@ -258,20 +447,16 @@ class RequestHandler(http.server.SimpleHTTPRequestHandler):
             self.wfile.write(HTML_PAGE.encode("utf-8"))
 
         elif self.path == "/api/state":
-            idx = state.current_index
-            total = len(state.timetable)
+            idx = data.current_index
+            total = len(data.timetable)
             
-            prev_item = state.timetable[idx - 1] if 0 <= (idx - 1) < total else None
-            curr_item = state.timetable[idx] if 0 <= idx < total else None
-            next_item = state.timetable[idx + 1] if 0 <= (idx + 1) < total else None
-
             payload = {
                 "currentIndex": idx,
                 "total": total,
-                "prev": prev_item,
-                "current": curr_item,
-                "next": next_item,
-                "timetable": state.timetable
+                "prev": data.timetable[idx - 1] if 0 <= (idx - 1) < total else None,
+                "current": data.timetable[idx] if 0 <= idx < total else None,
+                "next": data.timetable[idx + 1] if 0 <= (idx + 1) < total else None,
+                "timetable": data.timetable
             }
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -280,47 +465,39 @@ class RequestHandler(http.server.SimpleHTTPRequestHandler):
 
     def do_POST(self):
         if self.path == "/api/action":
-            content_length = int(self.headers["Content-Length"])
-            post_data = self.rfile.read(content_length)
-            body = json.loads(post_data.decode("utf-8"))
+            length = int(self.headers["Content-Length"])
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
             action = body.get("action")
             msg = ""
 
             if action == "next":
-                if state.current_index + 1 < len(state.timetable):
-                    state.current_index += 1
-                    msg = apply_obs_by_index(state.current_index)
+                if data.current_index + 1 < len(data.timetable):
+                    data.current_index += 1
+                    msg = apply_obs_by_index(data.current_index)
                 else:
                     msg = "既に最後の演目です"
 
             elif action == "prev":
-                if state.current_index > 0:
-                    state.current_index -= 1
-                    msg = apply_obs_by_index(state.current_index)
-                elif state.current_index == 0:
-                    state.current_index = -1
-                    # 開始前に戻す場合、テロップを消す
-                    ws.call(obs_requests.SetSceneItemEnabled(
-                        sceneName=SCENE_MAIN,
-                        sceneItemId=item_id,
-                        sceneItemEnabled=False
-                    ))
+                if data.current_index > 0:
+                    data.current_index -= 1
+                    msg = apply_obs_by_index(data.current_index)
+                elif data.current_index == 0:
+                    data.current_index = -1
+                    set_source_visible(SCENE_MAIN, id_text_song, False)
                     msg = "開始前の待機状態に戻しました"
                 else:
                     msg = "これ以上前には戻れません"
 
             elif action == "sync":
-                fetch_timetable()
-                msg = "スプレッドシートと再同期しました！"
+                fetch_all_sheets()
+                info_text_cache.clear()
+                msg = "全スプレッドシートと再同期しました！"
 
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.end_headers()
             self.wfile.write(json.dumps({"message": msg}).encode("utf-8"))
 
-# -------------------------------------------------------------
-# 6. サーバー起動
-# -------------------------------------------------------------
 print(f"\nブラウザから以下を開いてください:\nhttp://localhost:{WEB_PORT}\n")
 
 with socketserver.TCPServer(("", WEB_PORT), RequestHandler) as httpd:
@@ -328,4 +505,5 @@ with socketserver.TCPServer(("", WEB_PORT), RequestHandler) as httpd:
         httpd.serve_forever()
     except KeyboardInterrupt:
         print("\nサーバーを停止しました")
+        set_scroll_speed(TEXT_SOURCE_INFO, 0)
         ws.disconnect()

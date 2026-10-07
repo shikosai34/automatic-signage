@@ -4,14 +4,14 @@ from obswebsocket import obsws, requests
 # --- OBS接続設定 ---
 HOST = "localhost"
 PORT = 4455
-PASSWORD = ""
+PASSWORD = "GzQNnOZxEzEQQ5iI"
 
 ws = obsws(HOST, PORT, PASSWORD)
 ws.connect()
 print("OBSに接続しました！")
 
 SCENE_NAME = "シーン"
-TEXT_SOURCE = "テキスト (FreeType 2)"
+TEXT_SOURCE = "telop"
 
 # ---------------------------------------------
 # 1. シーン内の「シーンアイテムID」を取得する

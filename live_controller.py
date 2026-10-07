@@ -4,7 +4,7 @@ from obswebsocket import obsws, requests
 # --- OBS設定 ---
 HOST = "localhost"
 PORT = 4455
-PASSWORD = ""
+PASSWORD = "GzQNnOZxEzEQQ5iI"
 
 ws = obsws(HOST, PORT, PASSWORD)
 ws.connect()
@@ -12,7 +12,7 @@ print("=== OBSに接続しました ===")
 
 SCENE_MAIN = "シーン"
 SCENE_SUB = "シーン 2"
-TEXT_SOURCE = "テキスト (FreeType 2)"
+TEXT_SOURCE = "telop"
 
 # アイテムIDの取得
 res = ws.call(requests.GetSceneItemId(sceneName=SCENE_MAIN, sourceName=TEXT_SOURCE))
