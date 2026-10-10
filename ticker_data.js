@@ -1,1 +1,1 @@
-var latestTickerText = `【グッズ情報】マスコットキャラクターの被り物を販売中！ぜひお買い求めください。`;
+var latestTickerText = `【お知らせ】8号館1年4組にてお化け屋敷を開催中です！皆様のご来場をお待ちしています。`; var latestTickerTime = 1791624454.066857;

@@ -12,13 +12,13 @@ from obswebsocket import obsws, requests as obs_requests
 # -------------------------------------------------------------
 # 1. 設定項目
 # -------------------------------------------------------------
-# スプレッドシート各CSV URL
-SHEET_TIMETABLE_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vSVZ8pEwfQqdHHmyZu8V4fkVxVodYUqUj68R4cQiNgrjfqwp2l3SQNhA-yyW30bj5ebEjE8CJOEdf7a/pub?gid=0&single=true&output=csv"
-SHEET_CM_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vSVZ8pEwfQqdHHmyZu8V4fkVxVodYUqUj68R4cQiNgrjfqwp2l3SQNhA-yyW30bj5ebEjE8CJOEdf7a/pub?gid=1625346547&single=true&output=csv"
-SHEET_INFO_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vSVZ8pEwfQqdHHmyZu8V4fkVxVodYUqUj68R4cQiNgrjfqwp2l3SQNhA-yyW30bj5ebEjE8CJOEdf7a/pub?gid=1920382146&single=true&output=csv"
 
-# Gemini API (Cloudflare Workers)
-AI_API_URL = "https://shikosai-signage-api.kobot0526.workers.dev/api/format"
+# 新しいAPIのベースURL
+API_BASE_URL = "https://shikosai-signage-api.shikosai.workers.dev"
+
+# データベース（D1）からデータを取得するURL
+API_TIMETABLE_URL = f"{API_BASE_URL}/api/timetable"
+API_INFO_URL = f"{API_BASE_URL}/api/info"
 
 # OBS接続設定
 OBS_HOST = "localhost"
@@ -29,15 +29,12 @@ OBS_PASSWORD = "GzQNnOZxEzEQQ5iI"  # ★ここにOBSのパスワードを入力�
 SCENE_MAIN = "シーン"
 SOURCE_STAGE = "ステージ映像"
 SOURCE_CM = "CM映像"
-TEXT_SOURCE_SONG = "telop"  # 曲名テロップソース名
-TEXT_SOURCE_INFO = "infomation"             # AI情報テロップソース名
-FILTER_SCROLL = "スクロール"                # infomationに追加したフィルタ名
+TEXT_SOURCE_SONG = "telop"         # 曲名テロップソース名
+TEXT_SOURCE_INFO = "infomation"    # AI情報テロップソース名
+FILTER_SCROLL = "スクロール"       # infomationに追加したフィルタ名
 
 DEFAULT_CM_FILE_PATH = "C:/path/to/your_cm_video.mp4"
 WEB_PORT = 8080
-
-# テロップ表示枠の目安文字数（これ以下ならスクロールせず6秒表示）
-MAX_STATIC_CHARS = 24
 
 # -------------------------------------------------------------
 # 2. OBS接続 & 初期設定
@@ -85,20 +82,8 @@ def set_scroll_speed(source_name, speed):
         pass
 
 # -------------------------------------------------------------
-# 3. AI整形 & データ管理
+# 3. データ管理 & 定期取得
 # -------------------------------------------------------------
-def format_with_ai(raw_text):
-    try:
-        res = http_requests.post(AI_API_URL, json={"text": raw_text}, timeout=8)
-        res.raise_for_status()
-        data = res.json()
-        formatted = data.get("formatted_text", raw_text)
-        print(f"[AI整形] {raw_text} -> {formatted}")
-        return formatted
-    except Exception as e:
-        print(f"[AI整形エラー（生テキスト使用）]: {e}")
-        return raw_text
-
 class AppData:
     timetable = []
     cm_list = []
@@ -107,116 +92,130 @@ class AppData:
 
 data = AppData()
 
-def fetch_all_sheets():
-    # 1. タイムテーブル
+# 前回取得したデータを保持する変数
+prev_timetable = None
+prev_info_list = None
+
+def fetch_all_data():
+    global prev_timetable, prev_info_list
+
+    # 1. タイムテーブル取得
     try:
-        res = http_requests.get(SHEET_TIMETABLE_URL, timeout=5)
-        res.encoding = "utf-8"
-        reader = csv.DictReader(io.StringIO(res.text))
-        data.timetable = [r for r in reader if r.get("title") and r["title"].strip()]
-        print(f"タイムテーブル: {len(data.timetable)}件 取得")
+        res = http_requests.get(API_TIMETABLE_URL, timeout=5)
+        json_data = res.json()
+        new_timetable = [r for r in json_data if r.get("title") and str(r["title"]).strip()]
+        
+        # 初回または中身が変わった時だけ表示
+        if prev_timetable is None:
+            print(f"タイムテーブル: {len(new_timetable)}件 取得")
+        elif new_timetable != prev_timetable:
+            print(f"🔄 [更新検知] タイムテーブルが変更されました ({len(new_timetable)}件)")
+            
+        data.timetable = new_timetable
+        prev_timetable = new_timetable
     except Exception as e:
         print(f"タイムテーブル取得失敗: {e}")
 
     # 2. CM等
-    try:
-        res = http_requests.get(SHEET_CM_URL, timeout=5)
-        res.encoding = "utf-8"
-        reader = csv.DictReader(io.StringIO(res.text))
-        data.cm_list = [r for r in reader if str(r.get("is_active", "")).strip().upper() == "TRUE"]
-        print(f"CMリスト(有効): {len(data.cm_list)}件 取得")
-    except Exception as e:
-        print(f"CMリスト取得失敗: {e}")
+    data.cm_list = []
 
-    # 3. 下側情報欄（AI要約用）
+    # 3. 下側情報欄取得
     try:
-        res = http_requests.get(SHEET_INFO_URL, timeout=5)
-        res.encoding = "utf-8"
-        reader = csv.DictReader(io.StringIO(res.text))
+        res = http_requests.get(API_INFO_URL, timeout=5)
+        json_data = res.json()
         active_infos = []
-        for r in reader:
-            if str(r.get("is_active", "")).strip().upper() == "TRUE" and r.get("raw_text"):
+        for r in json_data:
+            if r.get("formatted_text") or r.get("raw_text"):
                 active_infos.append(r)
+
+        # 初回または中身が変わった時だけ表示
+        if prev_info_list is None:
+            print(f"下側情報欄(有効): {len(active_infos)}件 取得")
+        elif active_infos != prev_info_list:
+            print(f"📢 [更新検知] テロップ情報が更新されました (有効: {len(active_infos)}件)")
+
         data.info_list = active_infos
-        print(f"下側情報欄(有効): {len(data.info_list)}件 取得")
+        prev_info_list = active_infos
     except Exception as e:
-        print(f"下側情報欄取得失敗: {e}")
+        # 通信エラー時は毎回ログを出さず静かにスルー（必要なら出力可能）
+        pass
 
-fetch_all_sheets()
+fetch_all_data()
 
-# -------------------------------------------------------------
-# スプレッドシート常時自動更新ループ（バックグラウンド監視）
-# -------------------------------------------------------------
-AUTO_SYNC_INTERVAL = 20  # 自動更新の間隔（秒）
+# データベース常時自動更新ループ（バックグラウンド監視）
+AUTO_SYNC_INTERVAL = 10  # 10秒ごとにDBの最新状態をチェック
 
-def auto_sheet_sync_loop():
+def auto_sync_loop():
     while True:
         time.sleep(AUTO_SYNC_INTERVAL)
         try:
-            # 最新のデータを再取得
-            fetch_all_sheets()
-            
+            fetch_all_data()
         except Exception as e:
-            print(f"自動シート同期エラー: {e}")
+            print(f"自動同期エラー: {e}")
 
-# 自動更新スレッドを起動
-sync_thread = threading.Thread(target=auto_sheet_sync_loop, daemon=True)
+sync_thread = threading.Thread(target=auto_sync_loop, daemon=True)
 sync_thread.start()
 
 # -------------------------------------------------------------
-# 4. 下側テロップ 自動スクロール循環ループ（常時スレッド）
+# 4. 下側テロップ 自動スクロール循環ループ（緊急ジャック対応）
 # -------------------------------------------------------------
-info_text_cache = {}  # AIの重複リクエストを防ぐキャッシュ
-
 def ticker_loop():
     set_source_visible(SCENE_MAIN, id_text_info, True)
-    curr_idx = 0
+    
+    normal_idx = 0
+    emergency_idx = 0
     
     while True:
         if not data.info_list:
             time.sleep(3)
             continue
 
-            # ★追加：テロップを流す前に、スプレッドシートの新しい文章をまとめてAI変換しておく
-        for info_item in data.info_list:
-            chk_text = info_item.get("raw_text", "").strip()
-            if chk_text and chk_text not in info_text_cache:
-                info_text_cache[chk_text] = format_with_ai(chk_text)
+        # 1. 有効なテロップを仕分け
+        emergencies = []
+        normals = []
 
-        # 表示する文字の準備
-        item = data.info_list[curr_idx % len(data.info_list)]
-        raw_text = item.get("raw_text", "").strip()
+        for item in data.info_list:
+            tag = item.get("tag", "その他")
+            if "緊急" in tag:
+                emergencies.append(item)
+            else:
+                # 迷子落とし物も含め、緊急以外はすべて通常ループへ
+                normals.append(item)
 
-        if not raw_text:
-            curr_idx += 1
+        target_item = None
+
+        # --- 緊急ジャック判定 ---
+        # 緊急テロップが1件でもあれば、通常テロップは流さず緊急テロップのみループ
+        if emergencies:
+            target_item = emergencies[emergency_idx % len(emergencies)]
+            emergency_idx += 1
+        elif normals:
+            # 緊急がない場合は、通常テロップ（迷子含む）を順番に1件ずつループ
+            target_item = normals[normal_idx % len(normals)]
+            normal_idx += 1
+
+        if not target_item:
+            time.sleep(2)
+            continue
+
+        # 表示する文字列
+        display_text = target_item.get("formatted_text") or target_item.get("raw_text", "")
+        display_text = str(display_text).strip().replace("\n", " ").replace("\r", "")
+
+        if not display_text:
             time.sleep(1)
             continue
 
-        # ★事前に要約ストック済みなので、通信待ち時間ゼロで一瞬で取り出せる！
-        # ★安全装置：もし事前ストックから漏れていた場合は、その場で追加要約する
-        if raw_text not in info_text_cache:
-            info_text_cache[raw_text] = format_with_ai(raw_text)
-            
-        # 安全に取り出す（万が一AIエラーが起きても元の文章をそのまま流す）
-        display_text = info_text_cache.get(raw_text, raw_text)
-        
-        # ★バグ対策：AIが勝手に改行を入れて透明になるのを防ぐため、改行をスペースに変換
-        display_text = display_text.replace("\n", " ").replace("\r", "")
+        # HTMLブラウザソース用のファイル（ticker_data.js）へ書き出し
+        try:
+            with open("ticker_data.js", "w", encoding="utf-8") as f:
+                f.write(f'var latestTickerText = `{display_text}`; var latestTickerTime = {time.time()};')
+        except Exception as e:
+            print(f"ticker_data.js 書き込み失敗: {e}")
 
-        # 新しい HTMLブラウザソース用の処理
-        # ---------------------------------------------------
-        # 1. 取得したテキストを「ticker_data.js」というファイルに書き込む
-        with open("ticker_data.js", "w", encoding="utf-8") as f:
-            f.write(f'var latestTickerText = `{display_text}`;')
-
-        # 2. 前の文が真ん中あたりに来たら次を発射するように時間をさらに短縮！
+        # 文字数に応じた表示・待機時間
         wait_time = len(display_text) * 0.3 + 0.5
         time.sleep(wait_time)
-        
-        # 3. テロップが消えた後、次の情報が出るまでの間隔
-        #time.sleep(0.1)
-        
-        curr_idx += 1
 
 # スクロールループを別スレッドで開始
 ticker_thread = threading.Thread(target=ticker_loop, daemon=True)
@@ -230,7 +229,6 @@ is_in_break = False
 cm_timer_thread = None
 
 def play_next_cm():
-    """次のCM動画を再生する"""
     global cm_index
     if not data.cm_list:
         return
@@ -254,7 +252,6 @@ def play_next_cm():
         print(f"CM再生開始: {os.path.basename(cm_path)}")
 
 def cm_rotation_loop():
-    """break中にCMを定期的に次へ切り替えるループ"""
     while is_in_break:
         play_next_cm()
         for _ in range(15):
@@ -271,12 +268,9 @@ def apply_obs_by_index(idx):
 
     if item["type"] == "song":
         is_in_break = False
-        
-        # ステージ映像ON / CM映像OFF
         set_source_visible(SCENE_MAIN, id_stage, True)
         set_source_visible(SCENE_MAIN, id_cm, False)
 
-        # 曲名テロップ表示
         display_song = f"♪ {item['title']}"
         if item.get("band"):
             display_song += f" / {item['band']}"
@@ -286,14 +280,10 @@ def apply_obs_by_index(idx):
         return f"【曲】ステージ映像 & 曲テロップ: {display_song}"
 
     elif item["type"] == "break":
-        # 曲名テロップ非表示
         set_source_visible(SCENE_MAIN, id_text_song, False)
-
-        # ステージ映像OFF / CM映像ON
         set_source_visible(SCENE_MAIN, id_stage, False)
         set_source_visible(SCENE_MAIN, id_cm, True)
 
-        # CMローテーションループを開始
         if not is_in_break:
             is_in_break = True
             cm_timer_thread = threading.Thread(target=cm_rotation_loop, daemon=True)
@@ -302,7 +292,7 @@ def apply_obs_by_index(idx):
         return f"【幕間】CM再生開始 ({item['title']})"
 
 # -------------------------------------------------------------
-# 6. Webコントローラー画面 & サーバー起動
+# 6. Webコントローラー画面 & サーバー起動（ステージ進行用）
 # -------------------------------------------------------------
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="ja">
@@ -363,7 +353,7 @@ HTML_PAGE = """<!DOCTYPE html>
         <button class="btn btn-prev" onclick="sendAction('prev')">◀ 前へ戻る</button>
         <button class="btn btn-next" onclick="sendAction('next')">次へ進む ▶</button>
       </div>
-      <button class="btn-sync" onclick="sendAction('sync')">↻ 全スプレッドシート再同期</button>
+      <button class="btn-sync" onclick="sendAction('sync')">↻ データベースと再同期</button>
       <div id="status-msg"></div>
     </div>
 
@@ -490,9 +480,8 @@ class RequestHandler(http.server.SimpleHTTPRequestHandler):
                     msg = "これ以上前には戻れません"
 
             elif action == "sync":
-                fetch_all_sheets()
-                info_text_cache.clear()
-                msg = "全スプレッドシートと再同期しました！"
+                fetch_all_data()
+                msg = "最新のデータをデータベースから同期しました！"
 
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
