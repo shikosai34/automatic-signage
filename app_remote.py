@@ -155,8 +155,7 @@ def auto_sheet_sync_loop():
         try:
             # 最新のデータを再取得
             fetch_all_sheets()
-            # 案内文が変わった場合に備えて古いキャッシュをクリア
-            info_text_cache.clear()
+            
         except Exception as e:
             print(f"自動シート同期エラー: {e}")
 
@@ -172,12 +171,19 @@ info_text_cache = {}  # AIの重複リクエストを防ぐキャッシュ
 def ticker_loop():
     set_source_visible(SCENE_MAIN, id_text_info, True)
     curr_idx = 0
-
+    
     while True:
         if not data.info_list:
             time.sleep(3)
             continue
 
+            # ★追加：テロップを流す前に、スプレッドシートの新しい文章をまとめてAI変換しておく
+        for info_item in data.info_list:
+            chk_text = info_item.get("raw_text", "").strip()
+            if chk_text and chk_text not in info_text_cache:
+                info_text_cache[chk_text] = format_with_ai(chk_text)
+
+        # 表示する文字の準備
         item = data.info_list[curr_idx % len(data.info_list)]
         raw_text = item.get("raw_text", "").strip()
 
@@ -186,35 +192,30 @@ def ticker_loop():
             time.sleep(1)
             continue
 
-        # AIで要約（キャッシュがあれば再利用）
+        # ★事前に要約ストック済みなので、通信待ち時間ゼロで一瞬で取り出せる！
+        # ★安全装置：もし事前ストックから漏れていた場合は、その場で追加要約する
         if raw_text not in info_text_cache:
             info_text_cache[raw_text] = format_with_ai(raw_text)
-        display_text = info_text_cache[raw_text]
-
-        # 1. 速度0でテキスト更新
-        set_scroll_speed(TEXT_SOURCE_INFO, 0)
-        update_text_source(TEXT_SOURCE_INFO, display_text)
-
-        # 2. 短い文か長い文かで挙動を分岐
-        if len(display_text) <= MAX_STATIC_CHARS:
-            # 全文収まる場合はスクロールなしで6秒表示
-            time.sleep(5.0)
-        else:
-            # 収まらない場合は、まず2秒静止
-            time.sleep(1.0)
             
-            # スクロール開始（速度85）
-            SCROLL_SPEED = 85
-            set_scroll_speed(TEXT_SOURCE_INFO, SCROLL_SPEED)
-            
-            # 文字長さに応じたスクロール計算時間（1文字あたり約0.35秒）
-            scroll_duration = max(3.0, (len(display_text) - MAX_STATIC_CHARS) * 0.35)
-            time.sleep(scroll_duration)
+        # 安全に取り出す（万が一AIエラーが起きても元の文章をそのまま流す）
+        display_text = info_text_cache.get(raw_text, raw_text)
+        
+        # ★バグ対策：AIが勝手に改行を入れて透明になるのを防ぐため、改行をスペースに変換
+        display_text = display_text.replace("\n", " ").replace("\r", "")
 
-            # 文末が表示されたら停止して3秒待機
-            set_scroll_speed(TEXT_SOURCE_INFO, 0)
-            time.sleep(1.0)
+        # 新しい HTMLブラウザソース用の処理
+        # ---------------------------------------------------
+        # 1. 取得したテキストを「ticker_data.js」というファイルに書き込む
+        with open("ticker_data.js", "w", encoding="utf-8") as f:
+            f.write(f'var latestTickerText = `{display_text}`;')
 
+        # 2. 前の文が真ん中あたりに来たら次を発射するように時間をさらに短縮！
+        wait_time = len(display_text) * 0.3 + 0.5
+        time.sleep(wait_time)
+        
+        # 3. テロップが消えた後、次の情報が出るまでの間隔
+        #time.sleep(0.1)
+        
         curr_idx += 1
 
 # スクロールループを別スレッドで開始

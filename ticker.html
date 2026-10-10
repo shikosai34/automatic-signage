@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<style>
+    body {
+        margin: 0; padding: 0;
+        background-color: rgba(0, 0, 0, 0.7) !important; 
+        color: #FF9933 !important;
+        font-family: 'Meiryo', 'Hiragino Kaku Gothic ProN', sans-serif;
+        font-size: 40px;
+        font-weight: bold;
+        overflow: hidden;
+        position: relative;
+        height: 100vh;
+        display: flex;
+        align-items: center;
+    }
+    /* ★ idからclassに変更し、複数のテロップを同時に出せるようにしました */
+    .ticker-item {
+        position: absolute;
+        white-space: nowrap;
+        transform: translateX(100vw);
+    }
+</style>
+</head>
+<body>
+    <script>
+        let currentText = "";
+
+        function fetchTicker() {
+            const script = document.createElement('script');
+            script.src = 'ticker_data.js?t=' + new Date().getTime();
+            script.onload = () => {
+                if (typeof latestTickerText !== 'undefined') {
+                    if (latestTickerText !== currentText && latestTickerText.trim() !== "") {
+                        currentText = latestTickerText;
+                        playTicker(currentText);
+                    }
+                }
+                script.remove();
+            };
+            script.onerror = () => { script.remove(); };
+            document.body.appendChild(script);
+        }
+
+        function playTicker(text) {
+            // ★ 新しいテキストが来るたびに、新しい要素（div）を作って流す
+            const el = document.createElement('div');
+            el.className = 'ticker-item';
+            el.innerText = text;
+            document.body.appendChild(el);
+
+            const duration = text.length * 0.3 + 4;
+
+            setTimeout(() => {
+                el.style.transition = `transform ${duration}s linear`;
+                el.style.transform = 'translateX(-100%)';
+            }, 100);
+
+            // 流れた後に要素を自動で削除する（メモリ節約）
+            setTimeout(() => {
+                el.remove();
+            }, duration * 1000 + 500);
+        }
+
+        // 1秒ごとに更新を確認
+        setInterval(fetchTicker, 200);
+    </script>
+</body>
+</html>
