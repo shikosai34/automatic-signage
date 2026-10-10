@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>テロップ管理画面</title>
+  <style>
+    body { font-family: sans-serif; padding: 20px; background: #f4f4f9; }
+    .container { max-width: 600px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+    textarea { width: 100%; height: 100px; padding: 10px; box-sizing: border-box; font-size: 16px; }
+    button { background: #007bff; color: white; border: none; padding: 10px 20px; cursor: pointer; border-radius: 4px; font-size: 16px; margin-top: 10px; width: 100%; }
+    button:hover { background: #0056b3; }
+    .message { margin-top: 15px; font-weight: bold; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h2>📢 テロップ追加（AI自動整形）</h2>
+    <p>サークルからの雑な連絡文を入れると、AIが綺麗にしてDBに保存します。</p>
+    <textarea id="rawText" placeholder="例：1年4組の○○です！お化け屋敷やってるのでみんな来てください！"></textarea>
+    <button onclick="sendText()">送信してテロップに追加</button>
+    <div id="statusMessage" class="message"></div>
+  </div>
+
+  <script>
+    async function sendText() {
+      const text = document.getElementById('rawText').value;
+      const status = document.getElementById('statusMessage');
+
+      if (!text) {
+        status.style.color = "red";
+        status.innerText = "文章を入力してください。";
+        return;
+      }
+
+      status.style.color = "blue";
+      status.innerText = "送信中...（AIが整形しています）";
+
+      try {
+        // 1. AIで整形
+        const aiRes = await fetch('https://shikosai-signage-api.shikosai.workers.dev/api/format', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: text })
+        });
+        const aiData = await aiRes.json();
+
+        if (aiData.error) throw new Error(aiData.error);
+
+        // 2. 整形されたテキストをDBに保存
+        const dbRes = await fetch('https://shikosai-signage-api.shikosai.workers.dev/api/info', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: aiData.formatted_text })
+        });
+        
+        if (dbRes.ok) {
+          status.style.color = "green";
+          status.innerText = `成功！追加されたテロップ: ${aiData.formatted_text}`;
+          document.getElementById('rawText').value = ''; // 入力欄を空に戻す
+        }
+      } catch (e) {
+        status.style.color = "red";
+        status.innerText = "エラーが発生しました: " + e.message;
+      }
+    }
+  </script>
+</body>
+</html>
