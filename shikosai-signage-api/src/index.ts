@@ -478,11 +478,11 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
         </div>
         <div class="form-row" style="margin-top:12px;">
           <div style="flex:2; min-width:180px;">
-            <label style="font-size:12px; color:#94a3b8;">演目名・企画名</label>
+            <label style="font-size:12px; color:#94a3b8;">企画</label>
             <input type="text" id="ttTitle" placeholder="例: 吹奏楽部オープニング演奏">
           </div>
           <div style="flex:1; min-width:140px;">
-            <label style="font-size:12px; color:#94a3b8;">出演団体 / バンド名</label>
+            <label style="font-size:12px; color:#94a3b8;">詳細</label>
             <input type="text" id="ttBand" placeholder="例: 吹奏楽部">
           </div>
         </div>
@@ -541,9 +541,9 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
       </div>
       <div class="modal-body">
         <div class="guide-box">
-          💡 <strong>Excel / Googleスプレッドシートからそのままコピー＆貼り付けできます</strong><br>
-          列の順番: <code>[開始時刻]   [終了時刻]   [演目名]   [出演団体/バンド]   [種別]</code><br>
-          ※出演団体・種別（ステージ/幕間）は省略可能です。
+💡        <strong>Excel / Googleスプレッドシートからそのままコピー＆貼り付けできます</strong><br>
+          列の順番: <code>[開始時刻]   [終了時刻]   [企画]   [詳細]   [種別]</code><br>
+          ※詳細・種別（ステージ/幕間）は省略可能です。
         </div>
 
         <div class="form-group">
@@ -565,8 +565,8 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
             <tr>
               <th style="width:75px;">開始</th>
               <th style="width:75px;">終了</th>
-              <th>演目名</th>
-              <th>出演・バンド</th>
+              <th>企画</th>
+              <th>詳細</th>
               <th style="width:70px;">種別</th>
               <th style="width:110px;">状態</th>
             </tr>
@@ -671,8 +671,8 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
               '</div>' +
             '</div>' +
             '<div style="display:flex; gap:8px; margin-top:8px;">' +
-              '<input type="text" id="tt-title-' + item.id + '" value="' + escapeHtml(item.title) + '" placeholder="演目名" style="flex:2;">' +
-              '<input type="text" id="tt-band-' + item.id + '" value="' + escapeHtml(item.band || '') + '" placeholder="バンド/団体" style="flex:1;">' +
+              '<input type="text" id="tt-title-' + item.id + '" value="' + escapeHtml(item.title) + '" placeholder="企画" style="flex:2;">' +
+              '<input type="text" id="tt-band-' + item.id + '" value="' + escapeHtml(item.band || '') + '" placeholder="詳細" style="flex:1;">' +
             '</div>' +
             '<div style="display:flex; justify-content:flex-end; gap:8px; margin-top:10px;">' +
               '<button class="btn btn-save" onclick="updateTimetable(' + item.id + ', this)">変更保存</button>' +

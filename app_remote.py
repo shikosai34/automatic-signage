@@ -5,6 +5,7 @@ import csv
 import io
 import os
 import time
+import datetime  # ★追加: 自動切り替えのための時刻取得用
 import threading
 import requests as http_requests
 from obswebsocket import obsws, requests as obs_requests
@@ -58,17 +59,23 @@ id_cm = get_item_id(SCENE_MAIN, SOURCE_CM)
 
 def set_source_visible(scene_name, item_id, visible):
     if item_id is not None:
-        ws.call(obs_requests.SetSceneItemEnabled(
-            sceneName=scene_name,
-            sceneItemId=item_id,
-            sceneItemEnabled=visible
-        ))
+        try:
+            ws.call(obs_requests.SetSceneItemEnabled(
+                sceneName=scene_name,
+                sceneItemId=item_id,
+                sceneItemEnabled=visible
+            ))
+        except Exception:
+            pass
 
 def update_text_source(source_name, text):
-    ws.call(obs_requests.SetInputSettings(
-        inputName=source_name,
-        inputSettings={"text": text}
-    ))
+    try:
+        ws.call(obs_requests.SetInputSettings(
+            inputName=source_name,
+            inputSettings={"text": text}
+        ))
+    except Exception:
+        pass
 
 def set_scroll_speed(source_name, speed):
     """スクロールフィルタの水平速度を設定（0で停止）"""
@@ -137,7 +144,6 @@ def fetch_all_data():
         data.info_list = active_infos
         prev_info_list = active_infos
     except Exception as e:
-        # 通信エラー時は毎回ログを出さず静かにスルー（必要なら出力可能）
         pass
 
 fetch_all_data()
@@ -209,7 +215,6 @@ def ticker_loop():
             pass
 
         # 5. 前の文字のお尻が画面内に入るまでの秒数を計算して待機
-        # （文字の長さ × 1文字あたりの幅 ÷ 流れる速度 ＋ 余白分）
         text_char_count = len(display_text)
         wait_seconds = max(4.0, (text_char_count * 42 + 160) / 140.0 + 1.0)
         time.sleep(wait_seconds)
@@ -262,13 +267,15 @@ def apply_obs_by_index(idx):
         return "範囲外です"
 
     item = data.timetable[idx]
+    item_type = item.get("type", "song")
 
-    if item["type"] == "song":
+    if item_type == "song" or item_type == "ステージ（演奏・企画）":
         is_in_break = False
         set_source_visible(SCENE_MAIN, id_stage, True)
         set_source_visible(SCENE_MAIN, id_cm, False)
 
-        display_song = f"♪ {item['title']}"
+        # 企画（title）のみ、または 企画 / 詳細（band）の形式にする
+        display_song = item['title']
         if item.get("band"):
             display_song += f" / {item['band']}"
         update_text_source(TEXT_SOURCE_SONG, display_song)
@@ -276,7 +283,7 @@ def apply_obs_by_index(idx):
 
         return f"【曲】ステージ映像 & 曲テロップ: {display_song}"
 
-    elif item["type"] == "break":
+    elif item_type == "break" or item_type == "幕間（準備・CM放映）":
         set_source_visible(SCENE_MAIN, id_text_song, False)
         set_source_visible(SCENE_MAIN, id_stage, False)
         set_source_visible(SCENE_MAIN, id_cm, True)
@@ -286,7 +293,49 @@ def apply_obs_by_index(idx):
             cm_timer_thread = threading.Thread(target=cm_rotation_loop, daemon=True)
             cm_timer_thread.start()
 
-        return f"【幕間】CM再生開始 ({item['title']})"
+        return f"【幕間】CM映像ON ({item['title']})"
+
+# -------------------------------------------------------------
+# ★追加: 5.5 時刻監視による完全自動切り替えループ
+# -------------------------------------------------------------
+def auto_time_sync_loop():
+    """現在時刻を監視し、該当する演目があれば自動で切り替える"""
+    while True:
+        time.sleep(1)
+        if not data.timetable:
+            continue
+
+        # パソコンの現在時刻を取得 (例: "10:30")
+        now_str = datetime.datetime.now().strftime("%H:%M")
+        
+        active_idx = -1
+        for idx, item in enumerate(data.timetable):
+            start = item.get("start_time", "")
+            end = item.get("end_time", "")
+            # 現在の時刻が開始時刻〜終了時刻の間に入っているかチェック
+            if start and end and start <= now_str < end:
+                active_idx = idx
+                break
+        
+        # 当てはまる時間があり、かつ現在選択中の演目と異なる場合のみOBSを切り替える
+        if active_idx != -1 and active_idx != data.current_index:
+            print(f"\n[{now_str}] ⏰ 時間です！自動で切り替えます: {data.timetable[active_idx].get('title')}")
+            data.current_index = active_idx
+            apply_obs_by_index(data.current_index)
+        
+        # どの時間帯にも当てはまらない（空き時間）の処理
+        elif active_idx == -1 and data.current_index != -1:
+            # 最後に表示していた演目の終了時刻を過ぎていたら、待機状態にする
+            last_item = data.timetable[data.current_index] if data.current_index >= 0 else None
+            if last_item and last_item.get("end_time", "") <= now_str:
+                print(f"\n[{now_str}] 演目終了/待機時間になりました。")
+                data.current_index = -1
+                set_source_visible(SCENE_MAIN, id_text_song, False)
+                set_source_visible(SCENE_MAIN, id_stage, False)
+                set_source_visible(SCENE_MAIN, id_cm, True)
+
+auto_time_thread = threading.Thread(target=auto_time_sync_loop, daemon=True)
+auto_time_thread.start()
 
 # -------------------------------------------------------------
 # 6. Webコントローラー画面 & サーバー起動（ステージ進行用）
@@ -302,7 +351,7 @@ HTML_PAGE = """<!DOCTYPE html>
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #f8fafc; margin: 0; padding: 16px; }
     .container { max-width: 600px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; }
     .card { background: #1e293b; padding: 20px; border-radius: 16px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.3); }
-    .section-label { font-size: 13px; font-weight: bold; color: #94a3b8; text-transform: uppercase; margin-bottom: 6px; letter-spacing: 0.05em; }
+    .section-label { font-size: 13px; font-weight: bold; color: #94a3b8; text-transform: uppercase; margin-bottom: 6px; letter-spacing: 0.05em; display: flex; justify-content: space-between; }
     .slot { padding: 12px; border-radius: 10px; margin-bottom: 8px; }
     .slot-prev { background: #0f172a; border-left: 4px solid #64748b; opacity: 0.75; }
     .slot-current { background: #0284c7; border-left: 6px solid #38bdf8; padding: 16px; box-shadow: 0 4px 12px rgba(2, 132, 199, 0.4); }
@@ -323,6 +372,7 @@ HTML_PAGE = """<!DOCTYPE html>
     .tag-song { background: #166534; color: #bbf7d0; }
     .tag-break { background: #854d0e; color: #fef08a; }
     #status-msg { text-align: center; font-size: 13px; color: #38bdf8; min-height: 18px; margin-top: 8px; }
+    .auto-badge { font-size: 10px; background: #059669; padding: 2px 6px; border-radius: 10px; color: white; }
   </style>
 </head>
 <body>
@@ -335,9 +385,12 @@ HTML_PAGE = """<!DOCTYPE html>
       </div>
 
       <div class="slot slot-current">
-        <div class="section-label" style="color:#e0f2fe;">● 現在送出中</div>
+        <div class="section-label" style="color:#e0f2fe;">
+          <span>● 現在送出中</span>
+          <span class="auto-badge">時刻で自動同期中</span>
+        </div>
         <div id="curr-title" class="slot-title">待機中（未開始）</div>
-        <div id="curr-sub" class="slot-sub">「次へ進む」を押して開始してください</div>
+        <div id="curr-sub" class="slot-sub">時間になると自動で開始されます</div>
       </div>
 
       <div class="slot slot-next">
@@ -347,11 +400,11 @@ HTML_PAGE = """<!DOCTYPE html>
       </div>
 
       <div class="btn-row">
-        <button class="btn btn-prev" onclick="sendAction('prev')">◀ 前へ戻る</button>
-        <button class="btn btn-next" onclick="sendAction('next')">次へ進む ▶</button>
+        <button class="btn btn-prev" onclick="sendAction('prev')">◀ 前へ戻る (手動)</button>
+        <button class="btn btn-next" onclick="sendAction('next')">次へ進む ▶ (手動)</button>
       </div>
       <button class="btn-sync" onclick="sendAction('sync')">↻ データベースと再同期</button>
-      <div id="status-msg"></div>
+      <div id="status-msg">※ 手動操作も可能です</div>
     </div>
 
     <div class="card">
@@ -367,45 +420,50 @@ HTML_PAGE = """<!DOCTYPE html>
         document.getElementById(elSub).innerText = '';
         return;
       }
-      const typeLabel = item.type === 'song' ? '【曲】' : '【幕間】';
+      const typeLabel = (item.type === 'song' || item.type === 'ステージ（演奏・企画）') ? '【曲】' : '【幕間】';
       document.getElementById(elTitle).innerText = `${typeLabel} ${item.title}`;
       document.getElementById(elSub).innerText = item.band ? `バンド/担当: ${item.band}` : '';
     }
 
     async function updateUI() {
-      const res = await fetch('/api/state');
-      const d = await res.json();
-      
-      renderSlot('prev-title', 'prev-sub', d.prev);
-      
-      if (d.current) {
-        renderSlot('curr-title', 'curr-sub', d.current);
-      } else {
-        document.getElementById('curr-title').innerText = d.currentIndex < 0 ? '待機中（未開始）' : '全スケジュール終了';
-        document.getElementById('curr-sub').innerText = d.currentIndex < 0 ? '「次へ進む」で開始' : '';
-      }
-
-      renderSlot('next-title', 'next-sub', d.next);
-
-      const listEl = document.getElementById('timetable-list');
-      listEl.innerHTML = '';
-      d.timetable.forEach((item, idx) => {
-        const itemDiv = document.createElement('div');
-        itemDiv.className = 'list-item' + (idx === d.currentIndex ? ' active' : '');
+      try {
+        const res = await fetch('/api/state');
+        const d = await res.json();
         
-        const tagClass = item.type === 'song' ? 'tag-song' : 'tag-break';
-        const tagText = item.type === 'song' ? '曲' : '幕間';
+        renderSlot('prev-title', 'prev-sub', d.prev);
+        
+        if (d.current) {
+          renderSlot('curr-title', 'curr-sub', d.current);
+        } else {
+          document.getElementById('curr-title').innerText = d.currentIndex < 0 ? '待機中（未開始）' : '全スケジュール終了';
+          document.getElementById('curr-sub').innerText = d.currentIndex < 0 ? '時間になると自動で開始されます' : '';
+        }
 
-        itemDiv.innerHTML = `
-          <div>
-            <span style="color:#94a3b8; margin-right:6px;">${idx + 1}.</span>
-            <span>${item.title}</span>
-            <span style="color:#94a3b8; font-size:12px; margin-left:8px;">${item.band || ''}</span>
-          </div>
-          <span class="tag ${tagClass}">${tagText}</span>
-        `;
-        listEl.appendChild(itemDiv);
-      });
+        renderSlot('next-title', 'next-sub', d.next);
+
+        const listEl = document.getElementById('timetable-list');
+        listEl.innerHTML = '';
+        d.timetable.forEach((item, idx) => {
+          const itemDiv = document.createElement('div');
+          itemDiv.className = 'list-item' + (idx === d.currentIndex ? ' active' : '');
+          
+          const isSong = (item.type === 'song' || item.type === 'ステージ（演奏・企画）');
+          const tagClass = isSong ? 'tag-song' : 'tag-break';
+          const tagText = isSong ? '曲' : '幕間';
+
+          itemDiv.innerHTML = `
+            <div>
+              <span style="color:#94a3b8; margin-right:6px;">${item.start_time}</span>
+              <span>${item.title}</span>
+              <span style="color:#94a3b8; font-size:12px; margin-left:8px;">${item.band || ''}</span>
+            </div>
+            <span class="tag ${tagClass}">${tagText}</span>
+          `;
+          listEl.appendChild(itemDiv);
+        });
+      } catch (e) {
+        console.error("更新エラー");
+      }
     }
 
     async function sendAction(action) {
@@ -420,7 +478,9 @@ HTML_PAGE = """<!DOCTYPE html>
       updateUI();
     }
 
+    // 初回実行と自動更新（Python側の自動進行をWeb画面に反映させるため）
     updateUI();
+    setInterval(updateUI, 2000); 
   </script>
 </body>
 </html>
