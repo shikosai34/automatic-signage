@@ -14,12 +14,14 @@ app.get('/', (c) => {
   return c.text('Shikosai Signage API is running!')
 })
 
-// ★スマホ・PC兼用 テロップ総合管理画面
+// 管理画面
 app.get('/admin', (c) => {
   return c.html(HTML_ADMIN_PAGE)
 })
 
-// 1. 【OBS・Python用】表示有効(is_active=1)なテロップのみ取得
+// ==========================================
+// 1. テロップ用 API
+// ==========================================
 app.get('/api/info', async (c) => {
   const { results } = await c.env.DB.prepare(
     'SELECT * FROM info WHERE is_active = 1 ORDER BY id DESC'
@@ -27,7 +29,6 @@ app.get('/api/info', async (c) => {
   return c.json(results)
 })
 
-// 2. 【管理画面用】全テロップ一覧（表示ONが上、表示OFFが下）
 app.get('/api/info/all', async (c) => {
   const { results } = await c.env.DB.prepare(
     'SELECT * FROM info ORDER BY is_active DESC, id DESC'
@@ -35,7 +36,6 @@ app.get('/api/info/all', async (c) => {
   return c.json(results)
 })
 
-// 3. 【追加】新しいテロップを登録
 app.post('/api/info', async (c) => {
   const body = await c.req.json()
   const rawText = body.raw_text || body.text || ''
@@ -50,7 +50,6 @@ app.post('/api/info', async (c) => {
   return c.json({ success: true })
 })
 
-// 4. 【更新】リスト上の項目を編集・表示切替
 app.post('/api/info/update', async (c) => {
   const body = await c.req.json()
   const { id, formatted_text, tag, is_active } = body
@@ -62,173 +61,961 @@ app.post('/api/info/update', async (c) => {
   return c.json({ success: true })
 })
 
-// 5. 【削除】不要なテロップを削除
 app.post('/api/info/delete', async (c) => {
   const body = await c.req.json()
   await c.env.DB.prepare('DELETE FROM info WHERE id = ?').bind(body.id).run()
   return c.json({ success: true })
 })
 
-// 6. タイムテーブル取得
+// ==========================================
+// 2. タイムテーブル API
+// ==========================================
 app.get('/api/timetable', async (c) => {
-  const { results } = await c.env.DB.prepare('SELECT * FROM timetable').all()
-  return c.json(results)
+  try {
+    const { results } = await c.env.DB.prepare(
+      'SELECT * FROM timetable ORDER BY start_time ASC, id ASC'
+    ).all()
+    return c.json(results)
+  } catch (e: any) {
+    return c.json({ error: e.message }, 500)
+  }
 })
 
-// 7. AI整形API
+// タイムテーブル新規登録（時間重複チェック付き）
+app.post('/api/timetable', async (c) => {
+  const body = await c.req.json()
+  const startTime = body.start_time || ''
+  const endTime = body.end_time || ''
+  const title = body.title || ''
+  const band = body.band || ''
+  const type = body.type || 'song'
+
+  if (!startTime || !endTime) {
+    return c.json({ error: "開始時刻と終了時刻を指定してください" }, 400)
+  }
+
+  if (startTime >= endTime) {
+    return c.json({ error: "終了時刻は開始時刻より後に設定してください" }, 400)
+  }
+
+  // 時間重複の確認
+  const { results: overlaps } = await c.env.DB.prepare(
+    'SELECT title, start_time, end_time FROM timetable WHERE ? < end_time AND ? > start_time'
+  ).bind(startTime, endTime).all()
+
+  if (overlaps && overlaps.length > 0) {
+    const conflict: any = overlaps[0]
+    return c.json({ 
+      error: `時間が重複しています（既存: ${conflict.start_time}〜${conflict.end_time} 「${conflict.title}」）` 
+    }, 400)
+  }
+
+  await c.env.DB.prepare(
+    'INSERT INTO timetable (start_time, end_time, title, band, type) VALUES (?, ?, ?, ?, ?)'
+  ).bind(startTime, endTime, title, band, type).run()
+
+  return c.json({ success: true })
+})
+
+// タイムテーブル一括インポート（バッチ登録）
+app.post('/api/timetable/batch', async (c) => {
+  try {
+    const body = await c.req.json()
+    const { items, overwrite } = body as {
+      items: Array<{ start_time: string; end_time: string; title: string; band?: string; type?: string }>
+      overwrite?: boolean
+    }
+
+    if (!items || !Array.isArray(items) || items.length === 0) {
+      return c.json({ error: "インポートするデータがありません" }, 400)
+    }
+
+    const sorted = [...items].sort((a, b) => a.start_time.localeCompare(b.start_time))
+    for (let i = 0; i < sorted.length; i++) {
+      const curr = sorted[i]
+      if (!curr.start_time || !curr.end_time || !curr.title) {
+        return c.json({ error: `「${curr.title || '無題'}」の入力内容を確認してください` }, 400)
+      }
+      if (curr.start_time >= curr.end_time) {
+        return c.json({ error: `「${curr.title}」の終了時刻（${curr.end_time}）が開始時刻（${curr.start_time}）より前または同じです` }, 400)
+      }
+      if (i > 0) {
+        const prev = sorted[i - 1]
+        if (curr.start_time < prev.end_time) {
+          return c.json({
+            error: `インポートデータ内で時間が重複しています（「${prev.title}」${prev.start_time}〜${prev.end_time} と 「${curr.title}」${curr.start_time}〜${curr.end_time}）`
+          }, 400)
+        }
+      }
+    }
+
+    if (!overwrite) {
+      const { results: existing } = await c.env.DB.prepare('SELECT title, start_time, end_time FROM timetable').all()
+      if (existing && existing.length > 0) {
+        for (const item of items) {
+          for (const ex of existing as any[]) {
+            if (item.start_time < ex.end_time && item.end_time > ex.start_time) {
+              return c.json({
+                error: `既存の演目と重複しています（既存: 「${ex.title}」${ex.start_time}〜${ex.end_time} vs 新規: 「${item.title}」${item.start_time}〜${item.end_time}）`
+              }, 400)
+            }
+          }
+        }
+      }
+    }
+
+    const stmts = []
+    if (overwrite) {
+      stmts.push(c.env.DB.prepare('DELETE FROM timetable'))
+    }
+
+    for (const item of sorted) {
+      stmts.push(
+        c.env.DB.prepare(
+          'INSERT INTO timetable (start_time, end_time, title, band, type) VALUES (?, ?, ?, ?, ?)'
+        ).bind(
+          item.start_time,
+          item.end_time,
+          item.title,
+          item.band || '',
+          item.type || 'song'
+        )
+      )
+    }
+
+    await c.env.DB.batch(stmts)
+    return c.json({ success: true, count: sorted.length })
+  } catch (e: any) {
+    return c.json({ error: e.message || '一括インポートに失敗しました' }, 500)
+  }
+})
+
+// タイムテーブル更新（時間重複チェック付き）
+app.post('/api/timetable/update', async (c) => {
+  const body = await c.req.json()
+  const { id, start_time, end_time, title, band, type } = body
+
+  if (!start_time || !end_time) {
+    return c.json({ error: "開始時刻と終了時刻を指定してください" }, 400)
+  }
+
+  if (start_time >= end_time) {
+    return c.json({ error: "終了時刻は開始時刻より後に設定してください" }, 400)
+  }
+
+  const { results: overlaps } = await c.env.DB.prepare(
+    'SELECT title, start_time, end_time FROM timetable WHERE ? < end_time AND ? > start_time AND id != ?'
+  ).bind(start_time, end_time, id).all()
+
+  if (overlaps && overlaps.length > 0) {
+    const conflict: any = overlaps[0]
+    return c.json({ 
+      error: `時間が重複しています（既存: ${conflict.start_time}〜${conflict.end_time} 「${conflict.title}」）` 
+    }, 400)
+  }
+
+  await c.env.DB.prepare(
+    'UPDATE timetable SET start_time = ?, end_time = ?, title = ?, band = ?, type = ? WHERE id = ?'
+  ).bind(start_time, end_time, title, band, type, id).run()
+
+  return c.json({ success: true })
+})
+
+// タイムテーブル削除
+app.post('/api/timetable/delete', async (c) => {
+  const body = await c.req.json()
+  await c.env.DB.prepare('DELETE FROM timetable WHERE id = ?').bind(body.id).run()
+  return c.json({ success: true })
+})
+
+// ==========================================
+// 3. 右側パネル用 API
+// ==========================================
+app.get('/api/sidebar', async (c) => {
+  try {
+    const { results } = await c.env.DB.prepare(
+      'SELECT * FROM sidebar_items WHERE is_active = 1 ORDER BY id DESC'
+    ).all()
+    return c.json(results || [])
+  } catch (e: any) {
+    return c.json({ error: e.message }, 500)
+  }
+})
+
+app.get('/api/sidebar/all', async (c) => {
+  try {
+    const { results } = await c.env.DB.prepare(
+      'SELECT * FROM sidebar_items ORDER BY is_active DESC, id DESC'
+    ).all()
+    return c.json(results || [])
+  } catch (e: any) {
+    return c.json({ error: e.message }, 500)
+  }
+})
+
+app.post('/api/sidebar', async (c) => {
+  try {
+    const body = await c.req.json()
+    const title = body.title || ''
+    const description = body.description || ''
+    const imageData = body.image_data || ''
+    const duration = body.duration ? Number(body.duration) : 10
+    const isActive = body.is_active !== undefined ? (body.is_active ? 1 : 0) : 1
+
+    await c.env.DB.prepare(
+      'INSERT INTO sidebar_items (title, description, image_data, duration, is_active) VALUES (?, ?, ?, ?, ?)'
+    ).bind(title, description, imageData, duration, isActive).run()
+
+    return c.json({ success: true })
+  } catch (e: any) {
+    return c.json({ error: e.message }, 500)
+  }
+})
+
+app.post('/api/sidebar/update', async (c) => {
+  try {
+    const body = await c.req.json()
+    const { id, title, description, duration, is_active } = body
+
+    if (title !== undefined && description !== undefined) {
+      await c.env.DB.prepare(
+        'UPDATE sidebar_items SET title = ?, description = ?, duration = ?, is_active = ? WHERE id = ?'
+      ).bind(title, description, Number(duration || 10), is_active ? 1 : 0, id).run()
+    } else if (is_active !== undefined) {
+      await c.env.DB.prepare(
+        'UPDATE sidebar_items SET is_active = ? WHERE id = ?'
+      ).bind(is_active ? 1 : 0, id).run()
+    }
+
+    return c.json({ success: true })
+  } catch (e: any) {
+    return c.json({ error: e.message }, 500)
+  }
+})
+
+app.post('/api/sidebar/delete', async (c) => {
+  try {
+    const body = await c.req.json()
+    await c.env.DB.prepare('DELETE FROM sidebar_items WHERE id = ?').bind(body.id).run()
+    return c.json({ success: true })
+  } catch (e: any) {
+    return c.json({ error: e.message }, 500)
+  }
+})
+
+// ==========================================
+// 4. AI整形 API
+// ==========================================
 app.post('/api/format', async (c) => {
   try {
     const body = await c.req.json()
     const rawText = body.text
     if (!rawText) return c.json({ error: "textがありません" }, 400)
 
-    const systemInstruction = `
-あなたは文化祭（茨香祭）のデジタルサイネージ・テロップ作成アシスタントです。
-サークルや関係者から送られてくる連絡文を、サイネージ下部に流すための簡潔で分かりやすい「テロップ用テキスト」に整形してください。
-
-【出力ルール】
-- 30文字〜45文字程度の日本語1行で出力すること。
-- 先頭に必ず適切なカテゴリタグを付けること。（例: 【完売情報】、【注意】、【お知らせ】、【イベント変更】、【落とし物】など）
-- 絵文字や不要な改行、挨拶文は削除すること。
-- 出力は整形後のテキストのみとし、解説や前置きは一切出力しないこと。
-`
     const apiKey = c.env.GEMINI_API_KEY
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key=${apiKey}`
+    if (!apiKey) return c.json({ error: "GEMINI_API_KEYが設定されていません" }, 500)
+
+    const prompt = `あなたは文化祭（茨香祭）のデジタルサイネージ・テロップ作成アシスタントです。
+以下の連絡文を、画面下部に流すための簡潔で分かりやすい「テロップ用テキスト」に整形してください。
+
+【ルール】
+- 25文字〜40文字程度の日本語1行で出力すること。
+- 先頭に必ず適切な角括弧タグを付けること（例: 【お知らせ】、【完売情報】、【落とし物】、【イベント】など）。
+- 絵文字や挨拶文は削除すること。
+- 整形後のテキストのみを出力し、解説や前置きは一切出力しないこと。
+
+【連絡文】
+${rawText}`
+
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-pro-preview:generateContent?key=${apiKey}`
 
     const response = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        system_instruction: { parts: { text: systemInstruction } },
-        contents: [{ parts: [{ text: rawText }] }],
+        contents: [{ parts: [{ text: prompt }] }],
         generationConfig: { temperature: 0.2 }
       })
     })
 
-    const data = await response.json()
-    if (!response.ok) return c.json({ error: "AI整形エラー" }, 500)
-
-    const formattedText = data.candidates[0].content.parts[0].text.trim()
+    const data: any = await response.json()
+    const formattedText = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim()
     return c.json({ formatted_text: formattedText })
-  } catch (e) {
-    return c.json({ error: "サーバー内部エラー" }, 500)
+  } catch (e: any) {
+    return c.json({ error: "サーバーエラー", message: e.message }, 500)
   }
 })
 
-// 管理画面のHTML定義
+// ==========================================
+// 5. 管理画面 HTML
+// ==========================================
 const HTML_ADMIN_PAGE = `<!DOCTYPE html>
 <html lang="ja">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>茨香祭 テロップ総合管理コンソール</title>
+  <title>茨香祭 総合管理コンソール</title>
   <style>
     * { box-sizing: border-box; }
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #f8fafc; margin: 0; padding: 16px; }
-    .container { max-width: 800px; margin: 0 auto; display: flex; flex-direction: column; gap: 20px; }
+    .container { max-width: 860px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; }
+    
+    .tab-nav { display: flex; gap: 8px; border-bottom: 2px solid #334155; padding-bottom: 8px; }
+    .tab-btn { flex: 1; padding: 12px; font-size: 15px; font-weight: bold; background: #1e293b; color: #94a3b8; border: none; border-radius: 8px; cursor: pointer; transition: 0.2s; }
+    .tab-btn.active { background: #0284c7; color: white; }
+
     .card { background: #1e293b; padding: 20px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
     h2, h3 { margin-top: 0; margin-bottom: 12px; }
-    textarea { width: 100%; height: 75px; padding: 10px; background: #0f172a; border: 1px solid #334155; color: #f8fafc; border-radius: 6px; font-size: 15px; resize: vertical; }
+    textarea, input[type="text"], input[type="time"], input[type="number"], select {
+      width: 100%; padding: 10px; background: #0f172a; border: 1px solid #334155; color: #f8fafc; border-radius: 6px; font-size: 15px;
+    }
+    textarea { height: 75px; resize: vertical; }
+    .form-group { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; }
     .form-row { display: flex; gap: 12px; margin-top: 10px; flex-wrap: wrap; align-items: center; }
-    select, input[type="text"] { background: #0f172a; border: 1px solid #334155; color: #f8fafc; padding: 8px 10px; border-radius: 6px; font-size: 14px; }
-    .btn { background: #2563eb; color: white; border: none; padding: 10px 18px; border-radius: 6px; cursor: pointer; font-weight: bold; transition: background 0.2s; }
-    .btn:hover { background: #1d4ed8; }
-    .btn-danger { background: #dc2626; padding: 6px 12px; font-size: 12px; }
-    .btn-danger:hover { background: #b91c1c; }
-    .btn-save { background: #059669; padding: 6px 12px; font-size: 12px; }
-    .btn-save:hover { background: #047857; }
-    .btn:disabled { opacity: 0.6; cursor: not-allowed; }
 
-    /* リスト表示 */
-    .list-container { display: flex; flex-direction: column; gap: 12px; }
-    .item-card { background: #1e293b; border-radius: 8px; padding: 14px; border-left: 5px solid #64748b; transition: 0.2s; }
+    .btn { background: #2563eb; color: white; border: none; padding: 10px 18px; border-radius: 6px; cursor: pointer; font-weight: bold; transition: 0.2s; }
+    .btn:hover { background: #1d4ed8; }
+    .btn-secondary { background: #475569; padding: 6px 14px; font-size: 13px; }
+    .btn-secondary:hover { background: #64748b; }
+    .btn-danger { background: #dc2626; padding: 6px 12px; font-size: 12px; }
+    .btn-save { background: #059669; padding: 6px 12px; font-size: 12px; }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    .list-container { display: flex; flex-direction: column; gap: 12px; margin-top: 10px; }
+    .item-card { background: #1e293b; border-radius: 8px; padding: 14px; border-left: 5px solid #64748b; }
     .item-active { border-left-color: #38bdf8; background: #1a2744; }
-    .item-inactive { opacity: 0.65; border-left-color: #475569; }
     .item-emergency { border-left-color: #ef4444 !important; }
+    .item-song { border-left-color: #10b981; }
+    .item-break { border-left-color: #f59e0b; }
     .item-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; flex-wrap: wrap; gap: 8px; }
 
-    .raw-text-box { font-size: 12px; color: #94a3b8; background: #0f172a; padding: 6px 10px; border-radius: 4px; margin-bottom: 8px; word-break: break-all; }
-    .edit-formatted { width: 100%; padding: 8px; background: #0f172a; border: 1px solid #334155; color: #38bdf8; font-size: 15px; font-weight: bold; border-radius: 4px; }
-    .item-footer { display: flex; justify-content: space-between; align-items: center; margin-top: 10px; font-size: 13px; }
+    .thumb-preview { width: 100%; max-height: 160px; object-fit: contain; background: #000; border-radius: 6px; margin: 8px 0; }
+    .upload-box { border: 2px dashed #475569; padding: 16px; text-align: center; border-radius: 8px; cursor: pointer; background: #0f172a; margin-bottom: 12px; }
 
-    /* トースト通知 */
-    #toast {
-      position: fixed;
-      bottom: 24px;
-      right: 24px;
-      background: #059669;
-      color: white;
-      padding: 12px 24px;
-      border-radius: 8px;
-      font-weight: bold;
-      box-shadow: 0 8px 16px rgba(0,0,0,0.4);
-      transform: translateY(100px);
-      opacity: 0;
-      transition: all 0.3s ease;
-      z-index: 1000;
-    }
-    #toast.show {
-      transform: translateY(0);
-      opacity: 1;
-    }
+    #toast { position: fixed; bottom: 24px; right: 24px; background: #059669; color: white; padding: 12px 24px; border-radius: 8px; font-weight: bold; box-shadow: 0 8px 16px rgba(0,0,0,0.4); transform: translateY(100px); opacity: 0; transition: all 0.3s ease; z-index: 2000; }
+    #toast.show { transform: translateY(0); opacity: 1; }
+
+    /* Quizlet風 モーダル */
+    .modal-overlay { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.75); display: none; align-items: center; justify-content: center; z-index: 1500; padding: 16px; }
+    .modal-overlay.active { display: flex; }
+    .modal-card { background: #1e293b; border: 1px solid #334155; border-radius: 12px; width: 100%; max-width: 820px; max-height: 90vh; display: flex; flex-direction: column; box-shadow: 0 20px 40px rgba(0,0,0,0.6); overflow: hidden; }
+    .modal-header { padding: 16px 20px; border-bottom: 1px solid #334155; display: flex; justify-content: space-between; align-items: center; }
+    .modal-body { padding: 20px; overflow-y: auto; flex: 1; }
+    .modal-footer { padding: 14px 20px; border-top: 1px solid #334155; display: flex; justify-content: space-between; align-items: center; background: #162032; }
+    .guide-box { background: rgba(56, 189, 248, 0.1); border-left: 4px solid #38bdf8; padding: 10px 14px; border-radius: 4px; font-size: 13px; color: #bae6fd; margin-bottom: 14px; line-height: 1.5; }
+    .import-table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 13px; }
+    .import-table th { background: #0f172a; text-align: left; padding: 8px 10px; color: #94a3b8; border: 1px solid #334155; }
+    .import-table td { padding: 8px 10px; border: 1px solid #334155; }
+    .import-table tr.has-error { background: rgba(239, 68, 68, 0.15); }
+    .import-table tr.has-error td { border-color: #ef4444; }
   </style>
 </head>
 <body>
   <div class="container">
-    <div class="card">
-      <h2>📢 テロップ新規登録</h2>
-      <textarea id="rawText" placeholder="サークルや本部からの連絡文を入力..."></textarea>
-      
-      <div class="form-row">
-        <label>タグ:
-          <select id="tagSelect">
-            <option value="グッズ案内">グッズ案内</option>
-            <option value="企画宣伝">企画宣伝</option>
-            <option value="迷子落とし物">迷子落とし物</option>
-            <option value="その他" selected>その他</option>
-            <option value="その他（そのまま）">その他（そのまま）</option>
-            <option value="緊急">🚨 緊急</option>
-            <option value="緊急（そのまま）">🚨 緊急（そのまま）</option>
-          </select>
-        </label>
-
-        <label style="margin-left:auto; display:flex; align-items:center; gap:6px;">
-          <input type="checkbox" id="isActiveCheck" checked> すぐに表示する
-        </label>
-
-        <button class="btn" id="submitBtn" onclick="submitItem()">送信して追加</button>
-      </div>
-      <div id="statusMsg" style="margin-top:10px; font-weight:bold; font-size:14px;"></div>
+    <div class="tab-nav">
+      <button class="tab-btn active" id="tabBtnTicker" onclick="switchTab('ticker')">📢 テロップ管理</button>
+      <button class="tab-btn" id="tabBtnTimetable" onclick="switchTab('timetable')">📅 タイムテーブル管理</button>
+      <button class="tab-btn" id="tabBtnSidebar" onclick="switchTab('sidebar')">🖼️ 右側パネル管理</button>
     </div>
 
-    <div class="card">
-      <div style="display:flex; justify-content:space-between; align-items:center;">
-        <h3>📋 登録テロップ一覧</h3>
-        <button class="btn" style="padding:6px 12px; font-size:12px; background:#334155;" onclick="loadList()">↻ リスト更新</button>
+    <!-- タブ1: テロップ管理 -->
+    <div id="tabContentTicker">
+      <div class="card">
+        <h2>📢 テロップ新規登録</h2>
+        <textarea id="rawText" placeholder="サークルや本部からの連絡文を入力..."></textarea>
+        <div class="form-row">
+          <label style="flex:1;">タグ:
+            <select id="tagSelect">
+              <option value="グッズ案内">グッズ案内</option>
+              <option value="企画宣伝">企画宣伝</option>
+              <option value="迷子落とし物">迷子落とし物</option>
+              <option value="その他" selected>その他</option>
+              <option value="その他（そのまま）">その他（そのまま）</option>
+              <option value="緊急">🚨 緊急</option>
+              <option value="緊急（そのまま）">🚨 緊急（そのまま）</option>
+            </select>
+          </label>
+          <label style="display:flex; align-items:center; gap:6px;">
+            <input type="checkbox" id="isActiveCheck" checked> すぐに表示する
+          </label>
+          <button class="btn" id="submitBtn" onclick="submitTicker()">送信して追加</button>
+        </div>
+        <div id="statusMsg" style="margin-top:10px; font-weight:bold; font-size:14px;"></div>
       </div>
-      <p style="font-size:12px; color:#94a3b8; margin-top:0;">※ 上側が表示有効、下側が表示停止中。文面やタグはここから直接編集して保存できます。</p>
-      
-      <div id="itemList" class="list-container">読み込み中...</div>
+
+      <div class="card" style="margin-top:16px;">
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+          <h3>📋 登録テロップ一覧</h3>
+          <button class="btn" style="padding:6px 12px; font-size:12px; background:#334155;" onclick="loadTickerList()">↻ 更新</button>
+        </div>
+        <div id="itemList" class="list-container">読み込み中...</div>
+      </div>
+    </div>
+
+    <!-- タブ2: タイムテーブル管理 -->
+    <div id="tabContentTimetable" style="display:none;">
+      <div class="card">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+          <h2 style="margin:0;">📅 タイムスケジュール新規登録</h2>
+          <button class="btn btn-secondary" onclick="openImportModal()">📋 一括インポート</button>
+        </div>
+        <div class="form-row">
+          <div style="flex:1; min-width:120px;">
+            <label style="font-size:12px; color:#94a3b8;">開始時刻</label>
+            <input type="time" id="ttStart" value="10:00">
+          </div>
+          <div style="flex:1; min-width:120px;">
+            <label style="font-size:12px; color:#94a3b8;">終了時刻</label>
+            <input type="time" id="ttEnd" value="10:30">
+          </div>
+          <div style="flex:1; min-width:120px;">
+            <label style="font-size:12px; color:#94a3b8;">種別</label>
+            <select id="ttType">
+              <option value="song">ステージ（演奏・企画）</option>
+              <option value="break">幕間（準備・CM放映）</option>
+            </select>
+          </div>
+        </div>
+        <div class="form-row" style="margin-top:12px;">
+          <div style="flex:2; min-width:180px;">
+            <label style="font-size:12px; color:#94a3b8;">演目名・企画名</label>
+            <input type="text" id="ttTitle" placeholder="例: 吹奏楽部オープニング演奏">
+          </div>
+          <div style="flex:1; min-width:140px;">
+            <label style="font-size:12px; color:#94a3b8;">出演団体 / バンド名</label>
+            <input type="text" id="ttBand" placeholder="例: 吹奏楽部">
+          </div>
+        </div>
+        <button class="btn" style="margin-top:14px; width:100%;" onclick="submitTimetable()">タイムテーブルに追加</button>
+      </div>
+
+      <div class="card" style="margin-top:16px;">
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+          <h3>📋 本日のタイムテーブル一覧</h3>
+          <button class="btn" style="padding:6px 12px; font-size:12px; background:#334155;" onclick="loadTimetableList()">↻ 更新</button>
+        </div>
+        <div id="timetableList" class="list-container">読み込み中...</div>
+      </div>
+    </div>
+
+    <!-- タブ3: 右側パネル管理 -->
+    <div id="tabContentSidebar" style="display:none;">
+      <div class="card">
+        <h2>🖼️ 右側パネル新規登録</h2>
+        <div class="upload-box" onclick="document.getElementById('sideFileInput').click()">
+          <div id="uploadPrompt">📷 タップして画像を選択（任意）</div>
+          <img id="sidePreviewImg" style="display:none; max-height:160px; margin:0 auto; border-radius:6px;" />
+          <input type="file" id="sideFileInput" accept="image/*" style="display:none;" onchange="handleImageSelect(event)">
+        </div>
+        <div class="form-group">
+          <label>タイトル:</label>
+          <input type="text" id="sideTitleInput" placeholder="例: 公式Tシャツ販売中！">
+        </div>
+        <div class="form-group">
+          <label>説明・本文:</label>
+          <textarea id="sideDescInput" placeholder="例: 本部テントにて限定販売中！"></textarea>
+        </div>
+        <div class="form-row">
+          <label>表示時間: <input type="number" id="sideDurationInput" value="10" min="3" max="60" style="width:60px;"> 秒</label>
+          <label style="margin-left:auto;"><input type="checkbox" id="sideActiveCheck" checked> すぐに表示</label>
+          <button class="btn" onclick="submitSidebar()">追加する</button>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:16px;">
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+          <h3>📋 右側パネル一覧</h3>
+          <button class="btn" style="padding:6px 12px; font-size:12px; background:#334155;" onclick="loadSidebarList()">↻ 更新</button>
+        </div>
+        <div id="sideList" class="list-container">読み込み中...</div>
+      </div>
     </div>
   </div>
 
-  <div id="toast">✅ 変更を保存しました！</div>
+  <!-- Quizlet風 一括インポートモーダル -->
+  <div class="modal-overlay" id="importModal">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3 style="margin:0;">📋 タイムテーブルの一括インポート</h3>
+        <button style="background:transparent; border:none; color:#94a3b8; font-size:24px; cursor:pointer;" onclick="closeImportModal()">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="guide-box">
+          💡 <strong>Excel / Googleスプレッドシートからそのままコピー＆貼り付けできます</strong><br>
+          列の順番: <code>[開始時刻]   [終了時刻]   [演目名]   [出演団体/バンド]   [種別]</code><br>
+          ※出演団体・種別（ステージ/幕間）は省略可能です。
+        </div>
+
+        <div class="form-group">
+          <label style="font-size:12px; color:#94a3b8;">貼り付けエリア</label>
+          <textarea id="importRawText" style="height:120px;" oninput="parseImportText()" placeholder="10:00	10:30	吹奏楽部オープニング	吹奏楽部	ステージ
+10:30	10:45	幕間準備		幕間
+10:45	11:30	ダンス部ステージ	ダンス部	ステージ"></textarea>
+        </div>
+
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-top:14px;">
+          <span style="font-size:13px; font-weight:bold;" id="importStats">解析結果: 0 件</span>
+          <label style="display:flex; align-items:center; gap:6px; font-size:13px; cursor:pointer;">
+            <input type="checkbox" id="importOverwrite"> 既存のタイムテーブルを全消去して上書きする
+          </label>
+        </div>
+
+        <table class="import-table">
+          <thead>
+            <tr>
+              <th style="width:75px;">開始</th>
+              <th style="width:75px;">終了</th>
+              <th>演目名</th>
+              <th>出演・バンド</th>
+              <th style="width:70px;">種別</th>
+              <th style="width:110px;">状態</th>
+            </tr>
+          </thead>
+          <tbody id="importPreviewBody">
+            <tr><td colspan="6" style="text-align:center; color:#64748b; padding:16px;">データを貼り付けるとここにリアルタイムプレビューが表示されます</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" onclick="closeImportModal()">キャンセル</button>
+        <button class="btn" id="btnExecuteImport" onclick="executeBatchImport()" disabled>インポートする</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast">✅ 完了しました！</div>
 
   <script>
     const API_BASE = window.location.origin;
     const TAG_LIST = ["グッズ案内", "企画宣伝", "迷子落とし物", "その他", "その他（そのまま）", "緊急", "緊急（そのまま）"];
+    let parsedBatchItems = [];
+    let selectedImageData = '';
 
-    function showToast(message, isError) {
+    function showToast(msg, isError = false) {
       const toast = document.getElementById('toast');
-      toast.innerText = message;
+      toast.innerText = msg;
       toast.style.background = isError ? '#dc2626' : '#059669';
       toast.classList.add('show');
-      setTimeout(() => {
-        toast.classList.remove('show');
-      }, 2200);
+      setTimeout(() => { toast.classList.remove('show'); }, 2200);
     }
 
-    async function submitItem() {
+    function switchTab(tab) {
+      document.getElementById('tabContentTicker').style.display = (tab === 'ticker') ? 'block' : 'none';
+      document.getElementById('tabContentTimetable').style.display = (tab === 'timetable') ? 'block' : 'none';
+      document.getElementById('tabContentSidebar').style.display = (tab === 'sidebar') ? 'block' : 'none';
+
+      document.getElementById('tabBtnTicker').className = 'tab-btn' + (tab === 'ticker' ? ' active' : '');
+      document.getElementById('tabBtnTimetable').className = 'tab-btn' + (tab === 'timetable' ? ' active' : '');
+      document.getElementById('tabBtnSidebar').className = 'tab-btn' + (tab === 'sidebar' ? ' active' : '');
+
+      if (tab === 'timetable') loadTimetableList();
+      if (tab === 'sidebar') loadSidebarList();
+    }
+
+    // --- タイムテーブル処理 ---
+    async function submitTimetable() {
+      const startTime = document.getElementById('ttStart').value;
+      const endTime = document.getElementById('ttEnd').value;
+      const title = document.getElementById('ttTitle').value.trim();
+      const band = document.getElementById('ttBand').value.trim();
+      const type = document.getElementById('ttType').value;
+
+      if (!title) return alert("演目名・企画名を入力してください");
+
+      try {
+        const res = await fetch(API_BASE + '/api/timetable', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ start_time: startTime, end_time: endTime, title, band, type })
+        });
+
+        const data = await res.json();
+
+        if (res.ok) {
+          showToast("📅 タイムスケジュールに追加しました！");
+          document.getElementById('ttTitle').value = '';
+          document.getElementById('ttBand').value = '';
+          loadTimetableList();
+        } else {
+          showToast("❌ " + (data.error || "追加失敗"), true);
+        }
+      } catch (err) {
+        showToast("❌ 通信エラーが発生しました", true);
+      }
+    }
+
+    async function loadTimetableList() {
+      const listEl = document.getElementById('timetableList');
+      try {
+        const res = await fetch(API_BASE + '/api/timetable');
+        const items = await res.json();
+        if (!items || items.length === 0) {
+          listEl.innerHTML = '<div style="text-align:center; color:#64748b;">登録された演目はありません</div>';
+          return;
+        }
+
+        listEl.innerHTML = '';
+        items.forEach(item => {
+          const card = document.createElement('div');
+          card.className = 'item-card ' + (item.type === 'song' ? 'item-song' : 'item-break');
+          card.innerHTML = 
+            '<div class="item-header">' +
+              '<div style="display:flex; gap:8px; align-items:center;">' +
+                '<input type="time" id="tt-s-' + item.id + '" value="' + (item.start_time || '') + '" style="width:110px;">' +
+                '<span>〜</span>' +
+                '<input type="time" id="tt-e-' + item.id + '" value="' + (item.end_time || '') + '" style="width:110px;">' +
+                '<select id="tt-t-' + item.id + '" style="width:120px;">' +
+                  '<option value="song"' + (item.type === 'song' ? ' selected' : '') + '>ステージ</option>' +
+                  '<option value="break"' + (item.type === 'break' ? ' selected' : '') + '>幕間CM</option>' +
+                '</select>' +
+              '</div>' +
+            '</div>' +
+            '<div style="display:flex; gap:8px; margin-top:8px;">' +
+              '<input type="text" id="tt-title-' + item.id + '" value="' + escapeHtml(item.title) + '" placeholder="演目名" style="flex:2;">' +
+              '<input type="text" id="tt-band-' + item.id + '" value="' + escapeHtml(item.band || '') + '" placeholder="バンド/団体" style="flex:1;">' +
+            '</div>' +
+            '<div style="display:flex; justify-content:flex-end; gap:8px; margin-top:10px;">' +
+              '<button class="btn btn-save" onclick="updateTimetable(' + item.id + ', this)">変更保存</button>' +
+              '<button class="btn btn-danger" onclick="deleteTimetable(' + item.id + ')">削除</button>' +
+            '</div>';
+          listEl.appendChild(card);
+        });
+      } catch (e) {
+        listEl.innerHTML = '<div style="color:#f87171;">取得失敗</div>';
+      }
+    }
+
+    async function updateTimetable(id, btn) {
+      if (btn) { btn.disabled = true; btn.innerText = "保存中..."; }
+      const start_time = document.getElementById('tt-s-' + id).value;
+      const end_time = document.getElementById('tt-e-' + id).value;
+      const type = document.getElementById('tt-t-' + id).value;
+      const title = document.getElementById('tt-title-' + id).value;
+      const band = document.getElementById('tt-band-' + id).value;
+
+      try {
+        const res = await fetch(API_BASE + '/api/timetable/update', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id, start_time, end_time, type, title, band })
+        });
+        const data = await res.json();
+        if (res.ok) {
+          showToast("✅ タイムテーブルを更新しました！");
+          loadTimetableList();
+        } else {
+          showToast("❌ " + (data.error || "更新失敗"), true);
+          if (btn) { btn.disabled = false; btn.innerText = "変更保存"; }
+        }
+      } catch (e) {
+        showToast("❌ 通信エラーが発生しました", true);
+        if (btn) { btn.disabled = false; btn.innerText = "変更保存"; }
+      }
+    }
+
+    async function deleteTimetable(id) {
+      if (!confirm("この演目を削除しますか？")) return;
+      await fetch(API_BASE + '/api/timetable/delete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id })
+      });
+      showToast("🗑️ 削除しました");
+      loadTimetableList();
+    }
+
+    // --- 一括インポート処理 ---
+    function openImportModal() {
+      document.getElementById('importModal').classList.add('active');
+      document.getElementById('importRawText').focus();
+    }
+
+    function closeImportModal() {
+      document.getElementById('importModal').classList.remove('active');
+    }
+
+    function parseImportText() {
+      const text = document.getElementById('importRawText').value.trim();
+      const tbody = document.getElementById('importPreviewBody');
+      const statsEl = document.getElementById('importStats');
+      const btnExecute = document.getElementById('btnExecuteImport');
+
+      parsedBatchItems = [];
+
+      if (!text) {
+        tbody.innerHTML = '<tr><td colspan="6" style="text-align:center; color:#64748b; padding:16px;">データを貼り付けるとここにリアルタイムプレビューが表示されます</td></tr>';
+        statsEl.innerText = '解析結果: 0 件';
+        btnExecute.disabled = true;
+        btnExecute.innerText = 'インポートする';
+        return;
+      }
+
+      const lines = text.split(/\\r?\\n/).filter(line => line.trim().length > 0);
+      const parsed = [];
+
+      lines.forEach((line, idx) => {
+        const cols = line.includes('\\t') ? line.split('\\t') : line.split(',');
+        const startTime = (cols[0] || '').trim();
+        const endTime = (cols[1] || '').trim();
+        const title = (cols[2] || '').trim();
+        const band = (cols[3] || '').trim();
+        const typeRaw = (cols[4] || '').trim();
+        const type = (typeRaw.includes('幕間') || typeRaw.includes('break') || typeRaw.includes('CM')) ? 'break' : 'song';
+
+        let error = '';
+        const timeRegex = /^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$/;
+
+        if (!startTime || !timeRegex.test(startTime)) {
+          error = '開始時刻が不正 (HH:MM)';
+        } else if (!endTime || !timeRegex.test(endTime)) {
+          error = '終了時刻が不正 (HH:MM)';
+        } else if (startTime >= endTime) {
+          error = '終了が開始より前';
+        } else if (!title) {
+          error = '演目名が空欄';
+        }
+
+        parsed.push({ idx: idx + 1, start_time: startTime, end_time: endTime, title, band, type, error });
+      });
+
+      for (let i = 0; i < parsed.length; i++) {
+        for (let j = i + 1; j < parsed.length; j++) {
+          const a = parsed[i];
+          const b = parsed[j];
+          if (!a.error && !b.error) {
+            if (a.start_time < b.end_time && a.end_time > b.start_time) {
+              a.error = '行' + b.idx + 'と時間重複';
+              b.error = '行' + a.idx + 'と時間重複';
+            }
+          }
+        }
+      }
+
+      let errorCount = 0;
+      tbody.innerHTML = parsed.map(p => {
+        if (p.error) errorCount++;
+        return '<tr class="' + (p.error ? 'has-error' : '') + '">' +
+          '<td>' + escapeHtml(p.start_time || '-') + '</td>' +
+          '<td>' + escapeHtml(p.end_time || '-') + '</td>' +
+          '<td><strong>' + escapeHtml(p.title || '-') + '</strong></td>' +
+          '<td>' + escapeHtml(p.band || '-') + '</td>' +
+          '<td>' + (p.type === 'song' ? 'ステージ' : '幕間') + '</td>' +
+          '<td>' + (p.error ? '<span style="color:#f87171; font-weight:bold;">❌ ' + p.error + '</span>' : '<span style="color:#4ade80;">✅ OK</span>') + '</td>' +
+        '</tr>';
+      }).join('');
+
+      statsEl.innerHTML = '解析結果: <strong>' + parsed.length + '</strong> 件 ' + (errorCount > 0 ? '<span style="color:#f87171; margin-left:8px;">(エラー: ' + errorCount + '件)</span>' : '<span style="color:#4ade80; margin-left:8px;">(全件正常)</span>');
+
+      if (errorCount > 0 || parsed.length === 0) {
+        btnExecute.disabled = true;
+        btnExecute.innerText = 'エラーを修正してください';
+      } else {
+        btnExecute.disabled = false;
+        btnExecute.innerText = parsed.length + ' 件を一括インポート';
+        parsedBatchItems = parsed.map(p => ({
+          start_time: p.start_time,
+          end_time: p.end_time,
+          title: p.title,
+          band: p.band,
+          type: p.type
+        }));
+      }
+    }
+
+    async function executeBatchImport() {
+      if (parsedBatchItems.length === 0) return;
+      const overwrite = document.getElementById('importOverwrite').checked;
+
+      if (overwrite && !confirm("【確認】既存のタイムテーブルをすべて削除して置き換えますか？")) {
+        return;
+      }
+
+      const btnExecute = document.getElementById('btnExecuteImport');
+      btnExecute.disabled = true;
+      btnExecute.innerText = 'インポート処理中...';
+
+      try {
+        const res = await fetch(API_BASE + '/api/timetable/batch', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ items: parsedBatchItems, overwrite })
+        });
+        const data = await res.json();
+
+        if (res.ok) {
+          showToast('🎉 ' + data.count + ' 件を一括登録しました！');
+          closeImportModal();
+          document.getElementById('importRawText').value = '';
+          parseImportText();
+          loadTimetableList();
+        } else {
+          showToast('❌ ' + (data.error || 'インポート失敗'), true);
+          btnExecute.disabled = false;
+          btnExecute.innerText = parsedBatchItems.length + ' 件を一括インポート';
+        }
+      } catch (err) {
+        showToast('❌ 通信エラーが発生しました', true);
+        btnExecute.disabled = false;
+      }
+    }
+
+    // --- 右側パネル管理処理 ---
+    function handleImageSelect(event) {
+      const file = event.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = function(e) {
+        selectedImageData = e.target.result;
+        const img = document.getElementById('sidePreviewImg');
+        img.src = selectedImageData;
+        img.style.display = 'block';
+        document.getElementById('uploadPrompt').style.display = 'none';
+      };
+      reader.readAsDataURL(file);
+    }
+
+    async function submitSidebar() {
+      const title = document.getElementById('sideTitleInput').value.trim();
+      const desc = document.getElementById('sideDescInput').value.trim();
+      const duration = document.getElementById('sideDurationInput').value;
+      const isActive = document.getElementById('sideActiveCheck').checked;
+
+      if (!title) return alert("タイトルを入力してください");
+
+      try {
+        const res = await fetch(API_BASE + '/api/sidebar', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            title,
+            description: desc,
+            image_data: selectedImageData,
+            duration: Number(duration),
+            is_active: isActive ? 1 : 0
+          })
+        });
+        if (res.ok) {
+          showToast("🖼️ パネルスライドを追加しました！");
+          document.getElementById('sideTitleInput').value = '';
+          document.getElementById('sideDescInput').value = '';
+          selectedImageData = '';
+          document.getElementById('sidePreviewImg').style.display = 'none';
+          document.getElementById('uploadPrompt').style.display = 'block';
+          document.getElementById('sideFileInput').value = '';
+          loadSidebarList();
+        } else {
+          const err = await res.json();
+          showToast("❌ 追加失敗: " + (err.error || "エラー"), true);
+        }
+      } catch (e) {
+        showToast("❌ 通信エラーが発生しました", true);
+      }
+    }
+
+async function loadSidebarList() {
+      const listEl = document.getElementById('sideList');
+      try {
+        const res = await fetch(API_BASE + '/api/sidebar/all');
+        const items = await res.json();
+        if (!items || items.length === 0) {
+          listEl.innerHTML = '<div style="text-align:center; color:#64748b;">登録されたパネルはありません</div>';
+          return;
+        }
+        listEl.innerHTML = '';
+        items.forEach(item => {
+          const card = document.createElement('div');
+          card.className = 'item-card ' + (item.is_active ? 'item-active' : 'item-inactive');
+          card.innerHTML = 
+            '<div class="item-header" style="margin-bottom:12px;">' +
+              '<label style="display:flex; align-items:center; gap:8px; cursor:pointer;">' +
+                '<input type="checkbox" id="side-check-' + item.id + '"' + (item.is_active ? ' checked' : '') + ' onchange="updateSidebar(' + item.id + ')">' +
+                '<strong style="color:' + (item.is_active ? '#38bdf8' : '#94a3b8') + '">' + (item.is_active ? '● 表示中' : '✕ 非表示') + '</strong>' +
+              '</label>' +
+              '<div style="display:flex; align-items:center; gap:4px;">' +
+                '<span style="font-size:12px; color:#94a3b8;">表示秒数:</span>' +
+                '<input type="number" id="side-dur-' + item.id + '" value="' + (item.duration || 10) + '" style="width:60px; padding:4px 8px;">' +
+              '</div>' +
+            '</div>' +
+            (item.image_data ? '<img src="' + item.image_data + '" class="thumb-preview">' : '') +
+            '<div style="display:flex; flex-direction:column; gap:8px; margin-bottom:12px;">' +
+              '<input type="text" id="side-title-' + item.id + '" value="' + escapeHtml(item.title) + '" placeholder="タイトル">' +
+              '<textarea id="side-desc-' + item.id + '" placeholder="説明・本文">' + escapeHtml(item.description || '') + '</textarea>' +
+            '</div>' +
+            '<div style="display:flex; justify-content:flex-end; gap:8px;">' +
+              '<button class="btn btn-save" onclick="updateSidebar(' + item.id + ', this)">変更保存</button>' +
+              '<button class="btn btn-danger" onclick="deleteSidebar(' + item.id + ')">削除</button>' +
+            '</div>';
+          listEl.appendChild(card);
+        });
+      } catch (e) {
+        listEl.innerHTML = '<div style="color:#f87171;">取得失敗</div>';
+      }
+    }
+
+    async function updateSidebar(id, btn) {
+      if (btn) { btn.disabled = true; btn.innerText = "保存中..."; }
+      
+      const is_active = document.getElementById('side-check-' + id).checked;
+      const title = document.getElementById('side-title-' + id).value;
+      const description = document.getElementById('side-desc-' + id).value;
+      const duration = document.getElementById('side-dur-' + id).value;
+
+      try {
+        await fetch(API_BASE + '/api/sidebar/update', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ 
+            id, 
+            title, 
+            description, 
+            duration: Number(duration), 
+            is_active 
+          })
+        });
+        showToast("✅ パネルの変更を保存しました！");
+        if (!btn) {
+          // チェックボックス切り替え時はリスト全体を再描画
+          loadSidebarList(); 
+        } else {
+          btn.disabled = false;
+          btn.innerText = "変更保存";
+          // 枠の色だけ更新
+          const card = btn.closest('.item-card');
+          if (is_active) {
+            card.classList.add('item-active');
+            card.classList.remove('item-inactive');
+            card.querySelector('strong').style.color = '#38bdf8';
+            card.querySelector('strong').innerText = '● 表示中';
+          } else {
+            card.classList.add('item-inactive');
+            card.classList.remove('item-active');
+            card.querySelector('strong').style.color = '#94a3b8';
+            card.querySelector('strong').innerText = '✕ 非表示';
+          }
+        }
+      } catch (e) {
+        showToast("❌ 変更に失敗しました", true);
+        if (btn) { btn.disabled = false; btn.innerText = "変更保存"; }
+      }
+    }
+
+    async function deleteSidebar(id) {
+      if (!confirm("本当にこのパネルを削除しますか？")) return;
+      try {
+        await fetch(API_BASE + '/api/sidebar/delete', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id })
+        });
+        showToast("🗑️ パネルを削除しました");
+        loadSidebarList();
+      } catch (e) {
+        showToast("❌ 削除に失敗しました", true);
+      }
+    }
+
+    // --- テロップ処理・その他 ---
+    async function submitTicker() {
       const rawText = document.getElementById('rawText').value.trim();
       const tag = document.getElementById('tagSelect').value;
       const isActive = document.getElementById('isActiveCheck').checked;
@@ -236,13 +1023,11 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
       const submitBtn = document.getElementById('submitBtn');
 
       if (!rawText) return alert("文章を入力してください");
-
       submitBtn.disabled = true;
       status.style.color = "#38bdf8";
       status.innerText = "処理中...";
 
       let formattedText = rawText;
-
       if (!tag.includes("（そのまま）")) {
         try {
           status.innerText = "AIがテロップを成形中...";
@@ -253,9 +1038,7 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
           });
           const aiData = await aiRes.json();
           if (aiData.formatted_text) formattedText = aiData.formatted_text;
-        } catch (e) {
-          console.warn("AI整形失敗、元の文を使用します", e);
-        }
+        } catch (e) {}
       }
 
       status.innerText = "データベースに保存中...";
@@ -263,43 +1046,29 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
         const res = await fetch(API_BASE + '/api/info', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            raw_text: rawText,
-            formatted_text: formattedText,
-            tag: tag,
-            is_active: isActive
-          })
+          body: JSON.stringify({ raw_text: rawText, formatted_text: formattedText, tag: tag, is_active: isActive })
         });
-
         if (res.ok) {
           status.style.color = "#4ade80";
           status.innerText = "追加完了: " + formattedText;
           document.getElementById('rawText').value = '';
-          showToast("📢 新しいテロップを登録しました！", false);
-          loadList();
-        } else {
-          status.style.color = "#f87171";
-          status.innerText = "登録に失敗しました";
+          showToast("📢 テロップを登録しました！");
+          loadTickerList();
         }
-      } catch (err) {
-        status.style.color = "#f87171";
-        status.innerText = "通信エラーが発生しました";
       } finally {
         submitBtn.disabled = false;
       }
     }
 
-    async function loadList() {
+    async function loadTickerList() {
       const listEl = document.getElementById('itemList');
       try {
         const res = await fetch(API_BASE + '/api/info/all');
         const items = await res.json();
-
         if (!items || items.length === 0) {
           listEl.innerHTML = '<div style="text-align:center; color:#64748b;">登録されたテロップはありません</div>';
           return;
         }
-
         listEl.innerHTML = '';
         items.forEach(item => {
           const isEmergency = item.tag.includes('緊急');
@@ -308,80 +1077,51 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
 
           let tagOptions = '';
           TAG_LIST.forEach(t => {
-            const selected = (t === item.tag) ? ' selected' : '';
-            tagOptions += '<option value="' + t + '"' + selected + '>' + t + '</option>';
+            tagOptions += '<option value="' + t + '"' + ((t === item.tag) ? ' selected' : '') + '>' + t + '</option>';
           });
-
-          const activeColor = item.is_active ? '#38bdf8' : '#94a3b8';
-          const activeLabel = item.is_active ? '● 表示中' : '✕ 非表示';
-          const checkedAttr = item.is_active ? ' checked' : '';
 
           card.innerHTML = 
             '<div class="item-header">' +
               '<label style="display:flex; align-items:center; gap:8px; cursor:pointer;">' +
-                '<input type="checkbox" id="check-' + item.id + '"' + checkedAttr + ' onchange="updateItem(' + item.id + ', this)">' +
-                '<strong style="color:' + activeColor + '">' + activeLabel + '</strong>' +
+                '<input type="checkbox" id="check-' + item.id + '"' + (item.is_active ? ' checked' : '') + ' onchange="updateTicker(' + item.id + ')">' +
+                '<strong style="color:' + (item.is_active ? '#38bdf8' : '#94a3b8') + '">' + (item.is_active ? '● 表示中' : '✕ 非表示') + '</strong>' +
               '</label>' +
-              '<div style="display:flex; align-items:center; gap:8px;">' +
-                '<select id="tag-' + item.id + '" onchange="updateItem(' + item.id + ', this)">' + tagOptions + '</select>' +
-              '</div>' +
+              '<select id="tag-' + item.id + '" onchange="updateTicker(' + item.id + ')">' + tagOptions + '</select>' +
             '</div>' +
-            '<div class="raw-text-box">【入力原文】' + escapeHtml(item.raw_text) + '</div>' +
-            '<input type="text" class="edit-formatted" id="text-' + item.id + '" value="' + escapeHtml(item.formatted_text || item.raw_text) + '">' +
-            '<div class="item-footer">' +
-              '<button class="btn btn-save" onclick="updateItem(' + item.id + ', this)">変更を保存</button>' +
-              '<button class="btn btn-danger" onclick="deleteItem(' + item.id + ')">削除</button>' +
+            '<div style="font-size:12px; color:#94a3b8; margin-bottom:6px;">【入力原文】' + escapeHtml(item.raw_text) + '</div>' +
+            '<input type="text" id="text-' + item.id + '" value="' + escapeHtml(item.formatted_text || item.raw_text) + '">' +
+            '<div style="display:flex; justify-content:space-between; margin-top:10px;">' +
+              '<button class="btn btn-save" onclick="updateTicker(' + item.id + ', this)">変更を保存</button>' +
+              '<button class="btn btn-danger" onclick="deleteTicker(' + item.id + ')">削除</button>' +
             '</div>';
-
           listEl.appendChild(card);
         });
-      } catch (e) {
-        listEl.innerHTML = '<div style="color:#f87171;">一覧の取得に失敗しました</div>';
-      }
+      } catch (e) {}
     }
 
-    async function updateItem(id, btnElement) {
-      if (btnElement && btnElement.tagName === 'BUTTON') {
-        btnElement.disabled = true;
-        btnElement.innerText = "保存中...";
-      }
-
+    async function updateTicker(id, btn) {
+      if (btn) { btn.disabled = true; btn.innerText = "保存中..."; }
       const is_active = document.getElementById('check-' + id).checked;
       const tag = document.getElementById('tag-' + id).value;
       const formatted_text = document.getElementById('text-' + id).value;
-
-      try {
-        const res = await fetch(API_BASE + '/api/info/update', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ id, is_active, tag, formatted_text })
-        });
-        if (res.ok) {
-          showToast("✅ 変更を保存しました！", false);
-          loadList();
-        } else {
-          showToast("❌ 保存に失敗しました", true);
-        }
-      } catch (e) {
-        showToast("❌ 通信エラーが発生しました", true);
-      }
+      await fetch(API_BASE + '/api/info/update', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id, is_active, tag, formatted_text })
+      });
+      showToast("✅ 変更を保存しました！");
+      loadTickerList();
     }
 
-    async function deleteItem(id) {
+    async function deleteTicker(id) {
       if (!confirm("本当に削除しますか？")) return;
-      try {
-        const res = await fetch(API_BASE + '/api/info/delete', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ id })
-        });
-        if (res.ok) {
-          showToast("🗑️ テロップを削除しました", false);
-          loadList();
-        }
-      } catch (e) {
-        showToast("❌ 削除に失敗しました", true);
-      }
+      await fetch(API_BASE + '/api/info/delete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id })
+      });
+      showToast("🗑️ 削除しました");
+      loadTickerList();
     }
 
     function escapeHtml(str) {
@@ -390,7 +1130,7 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
       });
     }
 
-    loadList();
+    loadTickerList();
   </script>
 </body>
 </html>

@@ -1,1 +1,1 @@
-var latestTickerText = `【お知らせ】8号館1年4組にてお化け屋敷を開催中です！皆様のご来場をお待ちしています。`; var latestTickerTime = 1791624454.066857;
+var latestTickerText = `【お知らせ】１－４でお化け屋敷を開催中！楽しいのでぜひ遊びに来てくださいね。`; var latestTickerTime = 1791798740.1981614;

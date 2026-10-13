@@ -157,17 +157,15 @@ sync_thread = threading.Thread(target=auto_sync_loop, daemon=True)
 sync_thread.start()
 
 # -------------------------------------------------------------
-# 4. 下側テロップ 自動スクロール循環ループ（緊急ジャック対応）
+# 4. 下側テロップ 自動スクロール循環ループ（ブラウザソース連動）
 # -------------------------------------------------------------
 def ticker_loop():
-    set_source_visible(SCENE_MAIN, id_text_info, True)
-    
     normal_idx = 0
     emergency_idx = 0
     
     while True:
         if not data.info_list:
-            time.sleep(3)
+            time.sleep(2)
             continue
 
         # 1. 有効なテロップを仕分け
@@ -176,21 +174,18 @@ def ticker_loop():
 
         for item in data.info_list:
             tag = item.get("tag", "その他")
-            if "緊急" in tag:
+            if "緊急" in tag or item.get("is_emergency"):
                 emergencies.append(item)
             else:
-                # 迷子落とし物も含め、緊急以外はすべて通常ループへ
                 normals.append(item)
 
         target_item = None
 
-        # --- 緊急ジャック判定 ---
-        # 緊急テロップが1件でもあれば、通常テロップは流さず緊急テロップのみループ
+        # 2. 順番管理（緊急があれば緊急を優先）
         if emergencies:
             target_item = emergencies[emergency_idx % len(emergencies)]
             emergency_idx += 1
         elif normals:
-            # 緊急がない場合は、通常テロップ（迷子含む）を順番に1件ずつループ
             target_item = normals[normal_idx % len(normals)]
             normal_idx += 1
 
@@ -198,7 +193,7 @@ def ticker_loop():
             time.sleep(2)
             continue
 
-        # 表示する文字列
+        # 3. 表示するテキストを取得
         display_text = target_item.get("formatted_text") or target_item.get("raw_text", "")
         display_text = str(display_text).strip().replace("\n", " ").replace("\r", "")
 
@@ -206,16 +201,18 @@ def ticker_loop():
             time.sleep(1)
             continue
 
-        # HTMLブラウザソース用のファイル（ticker_data.js）へ書き出し
+        # 4. ticker_data.js へ書き出し（HTML側がこれを検知して流す）
         try:
             with open("ticker_data.js", "w", encoding="utf-8") as f:
-                f.write(f'var latestTickerText = `{display_text}`; var latestTickerTime = {time.time()};')
+                f.write(f'var latestTickerText = `{display_text}`; var latestTickerTime = {time.time()};\n')
         except Exception as e:
-            print(f"ticker_data.js 書き込み失敗: {e}")
+            pass
 
-        # 文字数に応じた表示・待機時間
-        wait_time = len(display_text) * 0.3 + 0.5
-        time.sleep(wait_time)
+        # 5. 前の文字のお尻が画面内に入るまでの秒数を計算して待機
+        # （文字の長さ × 1文字あたりの幅 ÷ 流れる速度 ＋ 余白分）
+        text_char_count = len(display_text)
+        wait_seconds = max(4.0, (text_char_count * 42 + 160) / 140.0 + 1.0)
+        time.sleep(wait_seconds)
 
 # スクロールループを別スレッドで開始
 ticker_thread = threading.Thread(target=ticker_loop, daemon=True)
