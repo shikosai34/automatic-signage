@@ -19,6 +19,13 @@ app.get('/admin', (c) => {
   return c.html(HTML_ADMIN_PAGE)
 })
 
+// 共通処理: 時刻のゼロ埋め（8:00 -> 08:00）
+const padTimeStr = (t: string) => {
+  if (!t) return '';
+  const p = t.split(':');
+  return p.length === 2 ? ('0' + p[0]).slice(-2) + ':' + ('0' + p[1]).slice(-2) : t;
+};
+
 // ==========================================
 // 0. 進行コントロール用 API
 // ==========================================
@@ -137,8 +144,8 @@ app.get('/api/timetable', async (c) => {
 
 app.post('/api/timetable', async (c) => {
   const body = await c.req.json()
-  const startTime = body.start_time || ''
-  const endTime = body.end_time || ''
+  const startTime = padTimeStr(body.start_time || '')
+  const endTime = padTimeStr(body.end_time || '')
   const title = body.title || ''
   const band = body.band || ''
   const type = body.type || 'song'
@@ -181,6 +188,11 @@ app.post('/api/timetable/batch', async (c) => {
       return c.json({ error: "インポートするデータがありません" }, 400)
     }
 
+    items.forEach(item => {
+      item.start_time = padTimeStr(item.start_time)
+      item.end_time = padTimeStr(item.end_time)
+    })
+
     const sorted = [...items].sort((a, b) => a.start_time.localeCompare(b.start_time))
     for (let i = 0; i < sorted.length; i++) {
       const curr = sorted[i]
@@ -205,7 +217,9 @@ app.post('/api/timetable/batch', async (c) => {
       if (existing && existing.length > 0) {
         for (const item of items) {
           for (const ex of existing as any[]) {
-            if (item.start_time < ex.end_time && item.end_time > ex.start_time) {
+            const exStart = padTimeStr(ex.start_time as string)
+            const exEnd = padTimeStr(ex.end_time as string)
+            if (item.start_time < exEnd && item.end_time > exStart) {
               return c.json({
                 error: `既存の企画「${ex.title}」(${ex.start_time}〜${ex.end_time}) と重複しています`
               }, 400)
@@ -243,7 +257,12 @@ app.post('/api/timetable/batch', async (c) => {
 
 app.post('/api/timetable/update', async (c) => {
   const body = await c.req.json()
-  const { id, start_time, end_time, title, band, type } = body
+  const id = body.id
+  const start_time = padTimeStr(body.start_time)
+  const end_time = padTimeStr(body.end_time)
+  const title = body.title
+  const band = body.band
+  const type = body.type
 
   if (!start_time || !end_time) {
     return c.json({ error: "開始時刻と終了時刻を指定してください" }, 400)
@@ -275,6 +294,39 @@ app.post('/api/timetable/delete', async (c) => {
   const body = await c.req.json()
   await c.env.DB.prepare('DELETE FROM timetable WHERE id = ?').bind(body.id).run()
   return c.json({ success: true })
+})
+
+app.post('/api/timetable/delete_range', async (c) => {
+  const body = await c.req.json()
+  const start_time = padTimeStr(body.start_time)
+  const end_time = padTimeStr(body.end_time)
+
+  if (!start_time || !end_time) {
+    return c.json({ error: "時刻を指定してください" }, 400)
+  }
+  if (start_time >= end_time) {
+    return c.json({ error: "終了時刻は開始時刻より後に設定してください" }, 400)
+  }
+
+  try {
+    const { results } = await c.env.DB.prepare('SELECT id, start_time, end_time FROM timetable').all()
+    if (!results || results.length === 0) return c.json({ success: true })
+
+    const idsToDelete = results.filter((row: any) => {
+      const s = padTimeStr(row.start_time)
+      const e = padTimeStr(row.end_time)
+      return s >= start_time && e <= end_time
+    }).map((row: any) => row.id)
+
+    if (idsToDelete.length > 0) {
+      const placeholders = idsToDelete.map(() => '?').join(',')
+      await c.env.DB.prepare(`DELETE FROM timetable WHERE id IN (${placeholders})`).bind(...idsToDelete).run()
+    }
+
+    return c.json({ success: true, count: idsToDelete.length })
+  } catch (e: any) {
+    return c.json({ error: e.message }, 500)
+  }
 })
 
 // ==========================================
@@ -406,22 +458,22 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #f8fafc; margin: 0; padding: 16px; }
     .container { max-width: 860px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; }
     
-    .tab-nav { display: flex; gap: 8px; border-bottom: 2px solid #334155; padding-bottom: 8px; overflow-x: auto; white-space: nowrap; }
-    .tab-btn { flex: 1; padding: 12px; font-size: 15px; font-weight: bold; background: #1e293b; color: #94a3b8; border: none; border-radius: 8px; cursor: pointer; transition: 0.2s; min-width: 140px; }
+    .tab-nav { display: flex; gap: 6px; border-bottom: 2px solid #334155; padding-bottom: 8px; overflow-x: auto; white-space: nowrap; }
+    .tab-btn { flex: 1; padding: 10px 8px; font-size: 14px; font-weight: bold; background: #1e293b; color: #94a3b8; border: none; border-radius: 8px; cursor: pointer; transition: 0.2s; min-width: 110px; text-align: center; }
     .tab-btn.active { background: #0284c7; color: white; }
 
-    .card { background: #1e293b; padding: 20px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
-    h2, h3 { margin-top: 0; margin-bottom: 12px; }
+    .card { background: #1e293b; padding: 16px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
+    h2, h3 { margin-top: 0; margin-bottom: 12px; font-size: 18px; }
     textarea, input[type="text"], input[type="time"], input[type="number"], select {
       width: 100%; padding: 10px; background: #0f172a; border: 1px solid #334155; color: #f8fafc; border-radius: 6px; font-size: 15px;
     }
     textarea { height: 75px; resize: vertical; }
     .form-group { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; }
-    .form-row { display: flex; gap: 12px; margin-top: 10px; flex-wrap: wrap; align-items: center; }
+    .form-row { display: flex; gap: 10px; margin-top: 10px; flex-wrap: wrap; align-items: center; }
 
-    .btn { background: #2563eb; color: white; border: none; padding: 10px 18px; border-radius: 6px; cursor: pointer; font-weight: bold; transition: 0.2s; }
+    .btn { background: #2563eb; color: white; border: none; padding: 10px 16px; border-radius: 6px; cursor: pointer; font-weight: bold; transition: 0.2s; font-size: 14px; }
     .btn:hover { background: #1d4ed8; }
-    .btn-secondary { background: #475569; padding: 6px 14px; font-size: 13px; }
+    .btn-secondary { background: #475569; padding: 6px 12px; font-size: 13px; }
     .btn-secondary:hover { background: #64748b; }
     .btn-danger { background: #dc2626; padding: 6px 12px; font-size: 12px; }
     .btn-save { background: #059669; padding: 6px 12px; font-size: 12px; }
@@ -454,39 +506,107 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
     .import-table tr.has-error { background: rgba(239, 68, 68, 0.15); }
     .import-table tr.has-error td { border-color: #ef4444; }
 
-    .control-slot { padding: 16px; border-radius: 10px; margin-bottom: 12px; }
+    .control-slot { padding: 14px; border-radius: 10px; margin-bottom: 12px; }
     .control-slot-prev { background: #0f172a; border-left: 4px solid #64748b; opacity: 0.75; }
-    .control-slot-current { background: #0284c7; border-left: 6px solid #38bdf8; box-shadow: 0 4px 12px rgba(2, 132, 199, 0.4); }
+    .control-slot-current { background: #0284c7; border-left: 6px solid #38bdf8; padding: 16px; box-shadow: 0 4px 12px rgba(2, 132, 199, 0.4); }
     .control-slot-next { background: #0f172a; border-left: 4px solid #3b82f6; }
-    .c-title { font-size: 20px; font-weight: bold; margin: 4px 0; }
-    .c-sub { font-size: 14px; color: #e2e8f0; }
-    .setting-box { background: #0f172a; border: 1px solid #334155; padding: 16px; border-radius: 10px; display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+    .c-title { font-size: 18px; font-weight: bold; margin: 4px 0; word-break: break-all; }
+    .c-sub { font-size: 13px; color: #e2e8f0; word-break: break-all; }
+    .setting-box { background: #0f172a; border: 1px solid #334155; padding: 14px; border-radius: 10px; display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; gap: 10px; }
     
     .switch-container { display: flex; align-items: center; gap: 10px; }
-    .switch { position: relative; display: inline-block; width: 44px; height: 24px; }
+    .switch { position: relative; display: inline-block; width: 44px; height: 24px; flex-shrink: 0; }
     .switch input { opacity: 0; width: 0; height: 0; }
     .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #475569; transition: .3s; border-radius: 24px; }
     .slider:before { position: absolute; content: ""; height: 18px; width: 18px; left: 3px; bottom: 3px; background-color: white; transition: .3s; border-radius: 50%; }
     input:checked + .slider { background-color: #10b981; }
     input:checked + .slider:before { transform: translateX(20px); }
+
+    /* スマホ対応（レスポンシブリスト） */
+    .ctrl-item-card { background: #0f172a; padding: 12px; border-radius: 8px; margin-bottom: 8px; border-left: 4px solid #64748b; font-size: 14px; display: flex; flex-direction: column; gap: 4px; }
+    .ctrl-item-card.active { background: #0369a1; border-left-color: #38bdf8; }
+    .ctrl-item-row { display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .ctrl-time { font-weight: bold; color: #38bdf8; font-size: 13px; }
+    .ctrl-title { font-weight: bold; font-size: 15px; color: #fff; word-break: break-all; }
+    .ctrl-band { color: #94a3b8; font-size: 13px; word-break: break-all; }
+
+    @media (max-width: 480px) {
+      body { padding: 8px; }
+      .card { padding: 12px; }
+      .tab-btn { font-size: 12px; padding: 8px 4px; min-width: 75px; }
+      .btn { padding: 14px; font-size: 16px; }
+    }
   </style>
 </head>
 <body>
   <div class="container">
     <div class="tab-nav">
-      <button class="tab-btn active" id="tabBtnTicker" onclick="switchTab('ticker')">📢 テロップ管理</button>
-      <button class="tab-btn" id="tabBtnTimetable" onclick="switchTab('timetable')">📅 タイムテーブル管理</button>
-      <button class="tab-btn" id="tabBtnSidebar" onclick="switchTab('sidebar')">🖼️ 右側パネル管理</button>
-      <button class="tab-btn" id="tabBtnControl" onclick="switchTab('control')">🎮 進行コントロール</button>
+      <button class="tab-btn active" id="tabBtnControl" onclick="switchTab('control')">🎮 進行</button>
+      <button class="tab-btn" id="tabBtnTicker" onclick="switchTab('ticker')">📢 テロップ</button>
+      <button class="tab-btn" id="tabBtnTimetable" onclick="switchTab('timetable')">📅 タイムテ</button>
+      <button class="tab-btn" id="tabBtnSidebar" onclick="switchTab('sidebar')">🖼️ パネル</button>
+    </div>
+
+    <!-- 進行コントロールタブ -->
+    <div id="tabContentControl">
+      <div class="card">
+        <h2 style="margin-bottom: 16px;">🎮 OBSステージ進行状態</h2>
+        
+        <div class="setting-box">
+          <div>
+            <div style="font-weight:bold; font-size:14px; margin-bottom:2px;">🕒 自動進行モード</div>
+            <div style="font-size:11px; color:#94a3b8;">時間に合わせてOBSを自動切り替え</div>
+          </div>
+          <div class="switch-container">
+            <span id="labelAutoMode" style="font-size:12px; font-weight:bold;">ON</span>
+            <label class="switch"><input type="checkbox" id="chkAutoMode" onchange="updateStateSetting()"><span class="slider"></span></label>
+          </div>
+        </div>
+
+        <div class="setting-box">
+          <div>
+            <div style="font-weight:bold; font-size:14px; margin-bottom:2px;">⏳ CM完走待ち機能</div>
+            <div style="font-size:11px; color:#94a3b8;">CM動画の終了を待って切り替え</div>
+          </div>
+          <div class="switch-container">
+            <span id="labelWaitCm" style="font-size:12px; font-weight:bold;">ON</span>
+            <label class="switch"><input type="checkbox" id="chkWaitCm" onchange="updateStateSetting()"><span class="slider"></span></label>
+          </div>
+        </div>
+
+        <div class="control-slot control-slot-prev">
+          <div style="font-size:11px; color:#94a3b8; font-weight:bold;">◀ 1つ前の企画</div>
+          <div id="ctrl-prev-title" class="c-title">なし</div>
+        </div>
+        <div class="control-slot control-slot-current">
+          <div style="font-size:11px; color:#e0f2fe; font-weight:bold;">● 現在の送出状態</div>
+          <div id="ctrl-curr-title" class="c-title">待機中</div>
+          <div id="ctrl-curr-sub" class="c-sub"></div>
+        </div>
+        <div class="control-slot control-slot-next">
+          <div style="font-size:11px; color:#94a3b8; font-weight:bold;">▶ 次の企画</div>
+          <div id="ctrl-next-title" class="c-title">なし</div>
+        </div>
+
+        <div style="display:flex; gap:10px; margin-top:14px;">
+          <button class="btn" style="flex:1; background:#475569; padding:14px; font-size:15px;" onclick="manualChange(-1)">◀ 前へ</button>
+          <button class="btn" style="flex:2; padding:14px; font-size:15px;" onclick="manualChange(1)">次へ ▶</button>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:16px;">
+        <h3>📋 演目進行リスト</h3>
+        <div id="ctrl-timetable-list" class="list-container" style="max-height: 320px; overflow-y:auto; gap:6px;"></div>
+      </div>
     </div>
 
     <!-- タブ1: テロップ管理 -->
-    <div id="tabContentTicker">
+    <div id="tabContentTicker" style="display:none;">
       <div class="card">
         <h2>📢 テロップ新規登録</h2>
         <textarea id="rawText" placeholder="サークルや本部からの連絡文を入力..."></textarea>
         <div class="form-row">
-          <label style="flex:1;">タグ:
+          <label style="flex:1; min-width:140px;">タグ:
             <select id="tagSelect">
               <option value="グッズ案内">グッズ案内</option>
               <option value="企画宣伝">企画宣伝</option>
@@ -497,10 +617,10 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
               <option value="緊急（そのまま）">🚨 緊急（そのまま）</option>
             </select>
           </label>
-          <label style="display:flex; align-items:center; gap:6px;">
-            <input type="checkbox" id="isActiveCheck" checked> すぐに表示する
+          <label style="display:flex; align-items:center; gap:6px; font-size:14px;">
+            <input type="checkbox" id="isActiveCheck" checked> すぐに表示
           </label>
-          <button class="btn" id="submitBtn" onclick="submitTicker()">送信して追加</button>
+          <button class="btn" id="submitBtn" onclick="submitTicker()" style="width:100%;">送信して追加</button>
         </div>
         <div id="statusMsg" style="margin-top:10px; font-weight:bold; font-size:14px;"></div>
       </div>
@@ -517,20 +637,23 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
     <!-- タブ2: タイムテーブル管理 -->
     <div id="tabContentTimetable" style="display:none;">
       <div class="card">
-        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
-          <h2 style="margin:0;">📅 タイムスケジュール新規登録</h2>
-          <button class="btn btn-secondary" onclick="openImportModal()">📋 一括インポート</button>
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; flex-wrap:wrap; gap:8px;">
+          <h2 style="margin:0;">📅 タイムスケジュール</h2>
+          <div style="display:flex; gap:6px;">
+            <button class="btn btn-secondary" style="background:#b91c1c; padding:6px 10px;" onclick="openDeleteRangeModal()">🗑️ 範囲削除</button>
+            <button class="btn btn-secondary" style="padding:6px 10px;" onclick="openImportModal()">📋 一括インポート</button>
+          </div>
         </div>
         <div class="form-row">
-          <div style="flex:1; min-width:120px;">
+          <div style="flex:1; min-width:110px;">
             <label style="font-size:12px; color:#94a3b8;">開始時刻</label>
             <input type="time" id="ttStart" value="10:00">
           </div>
-          <div style="flex:1; min-width:120px;">
+          <div style="flex:1; min-width:110px;">
             <label style="font-size:12px; color:#94a3b8;">終了時刻</label>
             <input type="time" id="ttEnd" value="10:30">
           </div>
-          <div style="flex:1; min-width:120px;">
+          <div style="flex:1; min-width:130px;">
             <label style="font-size:12px; color:#94a3b8;">種別</label>
             <select id="ttType">
               <option value="song">ステージ（演奏・企画）</option>
@@ -539,11 +662,11 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
           </div>
         </div>
         <div class="form-row" style="margin-top:12px;">
-          <div style="flex:2; min-width:180px;">
+          <div style="flex:2; min-width:160px;">
             <label style="font-size:12px; color:#94a3b8;">企画</label>
             <input type="text" id="ttTitle" placeholder="例: 吹奏楽部オープニング演奏">
           </div>
-          <div style="flex:1; min-width:140px;">
+          <div style="flex:1; min-width:130px;">
             <label style="font-size:12px; color:#94a3b8;">詳細</label>
             <input type="text" id="ttBand" placeholder="例: 吹奏楽部">
           </div>
@@ -578,9 +701,9 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
           <textarea id="sideDescInput" placeholder="例: 本部テントにて限定販売中！"></textarea>
         </div>
         <div class="form-row">
-          <label>表示時間: <input type="number" id="sideDurationInput" value="10" min="3" max="60" style="width:60px;"> 秒</label>
-          <label style="margin-left:auto;"><input type="checkbox" id="sideActiveCheck" checked> すぐに表示</label>
-          <button class="btn" onclick="submitSidebar()">追加する</button>
+          <label style="font-size:14px;">表示時間: <input type="number" id="sideDurationInput" value="10" min="3" max="60" style="width:60px;"> 秒</label>
+          <label style="margin-left:auto; font-size:14px;"><input type="checkbox" id="sideActiveCheck" checked> すぐに表示</label>
+          <button class="btn" style="width:100%; margin-top:8px;" onclick="submitSidebar()">追加する</button>
         </div>
       </div>
 
@@ -592,57 +715,33 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
         <div id="sideList" class="list-container">読み込み中...</div>
       </div>
     </div>
+  </div>
 
-    <!-- タブ4: 進行コントロール -->
-    <div id="tabContentControl" style="display:none;">
-      <div class="card">
-        <h2 style="margin-bottom: 16px;">🎮 OBSステージ進行状態</h2>
-        
-        <div class="setting-box">
-          <div>
-            <div style="font-weight:bold; font-size:15px; margin-bottom:4px;">🕒 自動進行モード</div>
-            <div style="font-size:12px; color:#94a3b8;">時間に合わせてOBSを自動で切り替えます。手動操作時はOFFになります。</div>
+  <!-- 範囲削除モーダル -->
+  <div class="modal-overlay" id="deleteRangeModal">
+    <div class="modal-card" style="max-width: 450px;">
+      <div class="modal-header">
+        <h3 style="margin:0;">🗑️ 指定範囲のタイムテーブル削除</h3>
+        <button style="background:transparent; border:none; color:#94a3b8; font-size:24px; cursor:pointer;" onclick="closeDeleteRangeModal()">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="guide-box" style="background: rgba(239, 68, 68, 0.1); border-left-color: #ef4444; color: #fca5a5;">
+          指定した時間帯（開始〜終了）に<strong>完全に収まる</strong>演目を一括で削除します。
+        </div>
+        <div class="form-row">
+          <div style="flex:1;">
+            <label style="font-size:12px; color:#94a3b8;">開始時刻</label>
+            <input type="time" id="delStartTime" value="00:00">
           </div>
-          <div class="switch-container">
-            <span id="labelAutoMode" style="font-size:13px; font-weight:bold;">ON</span>
-            <label class="switch"><input type="checkbox" id="chkAutoMode" onchange="updateStateSetting()"><span class="slider"></span></label>
+          <div style="flex:1;">
+            <label style="font-size:12px; color:#94a3b8;">終了時刻</label>
+            <input type="time" id="delEndTime" value="23:59">
           </div>
-        </div>
-
-        <div class="setting-box">
-          <div>
-            <div style="font-weight:bold; font-size:15px; margin-bottom:4px;">⏳ CM完走待ち機能</div>
-            <div style="font-size:12px; color:#94a3b8;">次の時間になっても、再生中のCM動画が終わるまで切り替えを待ちます。</div>
-          </div>
-          <div class="switch-container">
-            <span id="labelWaitCm" style="font-size:13px; font-weight:bold;">ON</span>
-            <label class="switch"><input type="checkbox" id="chkWaitCm" onchange="updateStateSetting()"><span class="slider"></span></label>
-          </div>
-        </div>
-
-        <div class="control-slot control-slot-prev">
-          <div style="font-size:12px; color:#94a3b8; font-weight:bold;">◀ 1つ前の企画</div>
-          <div id="ctrl-prev-title" class="c-title">なし</div>
-        </div>
-        <div class="control-slot control-slot-current">
-          <div style="font-size:12px; color:#e0f2fe; font-weight:bold;">● 現在の送出状態</div>
-          <div id="ctrl-curr-title" class="c-title">待機中</div>
-          <div id="ctrl-curr-sub" class="c-sub"></div>
-        </div>
-        <div class="control-slot control-slot-next">
-          <div style="font-size:12px; color:#94a3b8; font-weight:bold;">▶ 次の企画</div>
-          <div id="ctrl-next-title" class="c-title">なし</div>
-        </div>
-
-        <div style="display:flex; gap:12px; margin-top:16px;">
-          <button class="btn" style="flex:1; background:#475569;" onclick="manualChange(-1)">◀ 手動で前へ</button>
-          <button class="btn" style="flex:2;" onclick="manualChange(1)">手動で次へ ▶</button>
         </div>
       </div>
-
-      <div class="card" style="margin-top:16px;">
-        <h3>📋 演目進行リスト</h3>
-        <div id="ctrl-timetable-list" class="list-container" style="max-height: 300px; overflow-y:auto; gap:6px;"></div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" onclick="closeDeleteRangeModal()">キャンセル</button>
+        <button class="btn btn-danger" onclick="executeDeleteRange()">一括削除する</button>
       </div>
     </div>
   </div>
@@ -707,6 +806,15 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
     var gState = { current_index: -1, is_auto: 1, wait_cm: 0 };
     var gTimetable = [];
 
+    function padTime(t) {
+      if (!t) return '';
+      var p = t.split(':');
+      if (p.length === 2) {
+        return ('0' + p[0]).slice(-2) + ':' + ('0' + p[1]).slice(-2);
+      }
+      return t;
+    }
+
     function showToast(msg, isError) {
       var toast = document.getElementById('toast');
       if (!toast) return;
@@ -716,7 +824,6 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
       setTimeout(function() { toast.classList.remove('show'); }, 2200);
     }
 
-    // タブ切り替え処理
     function switchTab(tab) {
       var tabs = ['ticker', 'timetable', 'sidebar', 'control'];
       for (var i = 0; i < tabs.length; i++) {
@@ -738,7 +845,6 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
       if (tab === 'control') fetchState();
     }
 
-    // 進行コントロール処理
     async function fetchState() {
       try {
         var res = await fetch(API_BASE + '/api/state');
@@ -763,7 +869,7 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
         }
 
         renderControlUI();
-      } catch (e) {}
+      } catch (e) { console.error("State Fetch Error", e); }
     }
 
     async function updateStateSetting() {
@@ -798,7 +904,8 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
       var elPrev = document.getElementById('ctrl-prev-title');
       if (elPrev) {
         if (idx > 0 && gTimetable && gTimetable[idx - 1]) {
-          elPrev.innerText = (gTimetable[idx - 1].start_time || '') + " " + (gTimetable[idx - 1].title || '');
+          var pItem = gTimetable[idx - 1];
+          elPrev.innerText = padTime(pItem.start_time) + "〜" + padTime(pItem.end_time) + " | " + (pItem.title || '');
         } else {
           elPrev.innerText = "なし";
         }
@@ -809,9 +916,9 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
       if (elCurr) {
         if (idx >= 0 && gTimetable && gTimetable[idx]) {
           var item = gTimetable[idx];
-          var typeLabel = (item.type === 'song' || item.type === 'ステージ（演奏・企画）') ? '【企画】' : '【幕間】';
+          var typeLabel = (item.type === 'song' || item.type === 'ステージ（演奏・企画）') ? '【ステージ】' : '【幕間CM】';
           elCurr.innerText = typeLabel + " " + (item.title || '');
-          if (elSub) elSub.innerText = item.band ? "詳細: " + item.band : "";
+          if (elSub) elSub.innerText = (padTime(item.start_time) + " 〜 " + padTime(item.end_time)) + (item.band ? " | 詳細: " + item.band : "");
         } else {
           elCurr.innerText = "待機中・CM映像表示中";
           if (elSub) elSub.innerText = "時間になると自動で開始されます";
@@ -821,24 +928,35 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
       var elNext = document.getElementById('ctrl-next-title');
       if (elNext) {
         if (gTimetable && idx + 1 < gTimetable.length && gTimetable[idx + 1]) {
-          elNext.innerText = (gTimetable[idx + 1].start_time || '') + " " + (gTimetable[idx + 1].title || '');
+          var nItem = gTimetable[idx + 1];
+          elNext.innerText = padTime(nItem.start_time) + "〜" + padTime(nItem.end_time) + " | " + (nItem.title || '');
         } else {
           elNext.innerText = "なし";
         }
       }
 
+      // ★演目進行リストのスマホ対応＆「種別 / 企画 / 詳細」表示
       var listEl = document.getElementById('ctrl-timetable-list');
       if (listEl && gTimetable) {
         listEl.innerHTML = '';
-        for (var i = 0; i < gTimetable.length; i++) {
-          var it = gTimetable[i];
-          var div = document.createElement('div');
-          div.className = 'list-item' + (i === idx ? ' active' : '');
-          var isSong = (it.type === 'song' || it.type === 'ステージ（演奏・企画）');
-          div.innerHTML = '<div><span style="color:#94a3b8; margin-right:6px;">' + (it.start_time || '') + '</span><span>' + escapeHtml(it.title || '') + '</span></div>' +
-            '<span class="tag ' + (isSong ? 'tag-song' : 'tag-break') + '">' + (isSong ? '企画' : '幕間') + '</span>';
-          listEl.appendChild(div);
-        }
+        gTimetable.forEach(function(item, i) {
+          var card = document.createElement('div');
+          card.className = 'ctrl-item-card ' + (i === idx ? 'active' : '');
+          
+          var isSong = (item.type === 'song' || item.type === 'ステージ（演奏・企画）');
+          var typeBadge = isSong ? '<span class="tag tag-song">ステージ</span>' : '<span class="tag tag-break">幕間CM</span>';
+          var timeStr = padTime(item.start_time) + ' 〜 ' + padTime(item.end_time);
+
+          card.innerHTML = 
+            '<div class="ctrl-item-row">' +
+              '<span class="ctrl-time">🕒 ' + timeStr + '</span>' +
+              typeBadge +
+            '</div>' +
+            '<div class="ctrl-title">' + escapeHtml(item.title || '') + '</div>' +
+            (item.band ? '<div class="ctrl-band">詳細: ' + escapeHtml(item.band) + '</div>' : '');
+
+          listEl.appendChild(card);
+        });
       }
     }
 
@@ -849,7 +967,7 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
       }
     }, 2000);
 
-    // テロップ管理処理
+    // --- テロップ管理 ---
     async function submitTicker() {
       var rawText = document.getElementById('rawText').value.trim();
       var tag = document.getElementById('tagSelect').value;
@@ -906,17 +1024,15 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
           return;
         }
         listEl.innerHTML = '';
-        for (var i = 0; i < items.length; i++) {
-          var item = items[i];
+        items.forEach(function(item) {
           var isEmergency = (item.tag || '').indexOf('緊急') !== -1;
           var card = document.createElement('div');
           card.className = 'item-card ' + (item.is_active ? 'item-active' : 'item-inactive') + (isEmergency ? ' item-emergency' : '');
 
           var tagOptions = '';
-          for (var j = 0; j < TAG_LIST.length; j++) {
-            var t = TAG_LIST[j];
+          TAG_LIST.forEach(function(t) {
             tagOptions += '<option value="' + t + '"' + ((t === item.tag) ? ' selected' : '') + '>' + t + '</option>';
-          }
+          });
 
           card.innerHTML = 
             '<div class="item-header">' +
@@ -933,10 +1049,8 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
               '<button class="btn btn-danger" onclick="deleteTicker(' + item.id + ')">削除</button>' +
             '</div>';
           listEl.appendChild(card);
-        }
-      } catch (e) {
-        listEl.innerHTML = '<div style="color:#f87171;">取得失敗</div>';
-      }
+        });
+      } catch (e) {}
     }
 
     async function updateTicker(id, btn) {
@@ -964,10 +1078,10 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
       loadTickerList();
     }
 
-    // タイムテーブル処理
+    // --- タイムテーブル処理 ---
     async function submitTimetable() {
-      var startTime = document.getElementById('ttStart').value;
-      var endTime = document.getElementById('ttEnd').value;
+      var startTime = padTime(document.getElementById('ttStart').value);
+      var endTime = padTime(document.getElementById('ttEnd').value);
       var title = document.getElementById('ttTitle').value.trim();
       var band = document.getElementById('ttBand').value.trim();
       var type = document.getElementById('ttType').value;
@@ -1010,12 +1124,16 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
           var item = items[i];
           var card = document.createElement('div');
           card.className = 'item-card ' + ((item.type === 'song' || item.type === 'ステージ（演奏・企画）') ? 'item-song' : 'item-break');
+          
+          var safeStartTime = padTime(item.start_time);
+          var safeEndTime = padTime(item.end_time);
+
           card.innerHTML = 
             '<div class="item-header">' +
               '<div style="display:flex; gap:8px; align-items:center;">' +
-                '<input type="time" id="tt-s-' + item.id + '" value="' + (item.start_time || '') + '" style="width:110px;">' +
+                '<input type="time" id="tt-s-' + item.id + '" value="' + safeStartTime + '" style="width:110px;">' +
                 '<span>〜</span>' +
-                '<input type="time" id="tt-e-' + item.id + '" value="' + (item.end_time || '') + '" style="width:110px;">' +
+                '<input type="time" id="tt-e-' + item.id + '" value="' + safeEndTime + '" style="width:110px;">' +
                 '<select id="tt-t-' + item.id + '" style="width:120px;">' +
                   '<option value="song"' + ((item.type === 'song' || item.type === 'ステージ（演奏・企画）') ? ' selected' : '') + '>ステージ</option>' +
                   '<option value="break"' + ((item.type === 'break' || item.type === '幕間（準備・CM放映）') ? ' selected' : '') + '>幕間CM</option>' +
@@ -1039,8 +1157,8 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
 
     async function updateTimetable(id, btn) {
       if (btn) { btn.disabled = true; btn.innerText = "保存中..."; }
-      var start_time = document.getElementById('tt-s-' + id).value;
-      var end_time = document.getElementById('tt-e-' + id).value;
+      var start_time = padTime(document.getElementById('tt-s-' + id).value);
+      var end_time = padTime(document.getElementById('tt-e-' + id).value);
       var type = document.getElementById('tt-t-' + id).value;
       var title = document.getElementById('tt-title-' + id).value;
       var band = document.getElementById('tt-band-' + id).value;
@@ -1076,7 +1194,42 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
       loadTimetableList();
     }
 
-    // 一括インポート処理
+    function openDeleteRangeModal() {
+      document.getElementById('deleteRangeModal').classList.add('active');
+    }
+
+    function closeDeleteRangeModal() {
+      document.getElementById('deleteRangeModal').classList.remove('active');
+    }
+
+    async function executeDeleteRange() {
+      var start = padTime(document.getElementById('delStartTime').value);
+      var end = padTime(document.getElementById('delEndTime').value);
+      
+      if (!start || !end) return alert("時刻を指定してください");
+      if (start >= end) return alert("終了時刻を開始時刻より後にしてください");
+
+      if (!confirm("【確認】" + start + " 〜 " + end + " の範囲に完全に収まる演目をすべて削除します。\\nよろしいですか？")) return;
+
+      try {
+        var res = await fetch(API_BASE + '/api/timetable/delete_range', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ start_time: start, end_time: end })
+        });
+        var data = await res.json();
+        if (res.ok) {
+          showToast("🗑️ 範囲内の演目をすべて削除しました！", false);
+          closeDeleteRangeModal();
+          loadTimetableList();
+        } else {
+          showToast("❌ " + (data.error || "削除失敗"), true);
+        }
+      } catch (e) {
+        showToast("❌ 通信エラーが発生しました", true);
+      }
+    }
+
     function openImportModal() {
       document.getElementById('importModal').classList.add('active');
       document.getElementById('importRawText').focus();
@@ -1110,8 +1263,8 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
         if (!line) continue;
 
         var cols = (line.indexOf('\\t') !== -1) ? line.split('\\t') : line.split(',');
-        var startTime = (cols[0] || '').trim();
-        var endTime = (cols[1] || '').trim();
+        var startTime = padTime((cols[0] || '').trim());
+        var endTime = padTime((cols[1] || '').trim());
         var title = (cols[2] || '').trim();
         var band = (cols[3] || '').trim();
         var typeRaw = (cols[4] || '').trim();
@@ -1220,7 +1373,6 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
       }
     }
 
-    // 右側パネル管理処理
     function handleImageSelect(event) {
       var file = event.target.files[0];
       if (!file) return;
@@ -1265,7 +1417,8 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
           document.getElementById('sideFileInput').value = '';
           loadSidebarList();
         } else {
-          showToast("❌ 追加失敗", true);
+          var err = await res.json();
+          showToast("❌ 追加失敗: " + (err.error || "エラー"), true);
         }
       } catch (e) {
         showToast("❌ 通信エラーが発生しました", true);
@@ -1283,8 +1436,7 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
           return;
         }
         listEl.innerHTML = '';
-        for (var i = 0; i < items.length; i++) {
-          var item = items[i];
+        items.forEach(function(item) {
           var card = document.createElement('div');
           card.className = 'item-card ' + (item.is_active ? 'item-active' : 'item-inactive');
           card.innerHTML = 
@@ -1308,7 +1460,7 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
               '<button class="btn btn-danger" onclick="deleteSidebar(' + item.id + ')">削除</button>' +
             '</div>';
           listEl.appendChild(card);
-        }
+        });
       } catch (e) {
         listEl.innerHTML = '<div style="color:#f87171;">取得失敗</div>';
       }
@@ -1316,6 +1468,7 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
 
     async function updateSidebar(id, btn) {
       if (btn) { btn.disabled = true; btn.innerText = "保存中..."; }
+      
       var is_active = document.getElementById('side-check-' + id).checked;
       var title = document.getElementById('side-title-' + id).value;
       var description = document.getElementById('side-desc-' + id).value;
@@ -1379,8 +1532,8 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
       });
     }
 
-    // 初期起動
-    switchTab('ticker');
+    // 初期起動タブ
+    switchTab('control');
   </script>
 </body>
 </html>
