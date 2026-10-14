@@ -1,1 +1,1 @@
-var latestTickerText = `【お知らせ】本部にてTシャツを販売しております。ぜひお買い求めください。`; var latestTickerTime = 1791942450.1412241;
+var latestTickerText = `【お知らせ】こちらは緊急テスト文章です。表示の確認を行っております。`; var latestTickerTime = 1791962966.1742878;
