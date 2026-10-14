@@ -175,7 +175,7 @@
                     {
                         "name": "ステージ映像",
                         "source_uuid": "85986288-a31a-4002-a1f5-ed00fc068dec",
-                        "visible": true,
+                        "visible": false,
                         "locked": false,
                         "rot": 0.0,
                         "scale_ref": {
@@ -230,7 +230,7 @@
                     {
                         "name": "CM映像",
                         "source_uuid": "7f3afd02-9192-45ec-bab6-077488d529e1",
-                        "visible": false,
+                        "visible": true,
                         "locked": false,
                         "rot": 0.0,
                         "scale_ref": {
@@ -285,7 +285,7 @@
                     {
                         "name": "telop",
                         "source_uuid": "ccc9ec3a-5dff-432f-b153-b3c60613f1b6",
-                        "visible": true,
+                        "visible": false,
                         "locked": false,
                         "rot": 0.0,
                         "scale_ref": {
@@ -303,20 +303,20 @@
                         "id": 3,
                         "group_item_backup": false,
                         "pos": {
-                            "x": 407.0,
-                            "y": 838.0
+                            "x": 441.0,
+                            "y": 816.0
                         },
                         "pos_rel": {
-                            "x": -1.0240740776062012,
-                            "y": 0.5518518686294556
+                            "x": -0.9611111283302307,
+                            "y": 0.5111111402511597
                         },
                         "scale": {
-                            "x": 1.3697916269302368,
-                            "y": 1.3584905862808228
+                            "x": 1.4756944179534912,
+                            "y": 1.4716981649398804
                         },
                         "scale_rel": {
-                            "x": 1.3697916269302368,
-                            "y": 1.3584905862808228
+                            "x": 1.4756944179534912,
+                            "y": 1.4716981649398804
                         },
                         "bounds": {
                             "x": 0.0,
@@ -413,12 +413,12 @@
                         "id": 16,
                         "group_item_backup": false,
                         "pos": {
-                            "x": 1366.0,
-                            "y": 82.0
+                            "x": 1365.0,
+                            "y": 84.0
                         },
                         "pos_rel": {
-                            "x": 0.7518518567085266,
-                            "y": -0.8481481671333313
+                            "x": 0.75,
+                            "y": -0.8444444537162781
                         },
                         "scale": {
                             "x": 1.274999976158142,
@@ -610,7 +610,7 @@
             "id": "image_source",
             "versioned_id": "image_source",
             "settings": {
-                "file": "C:/Users/ovoya/OneDrive/画像/背景画像.png"
+                "file": "C:/Users/ovoya/shikosai-project/backcolor.png"
             },
             "mixers": 0,
             "sync": 0,
@@ -662,7 +662,7 @@
             "id": "ffmpeg_source",
             "versioned_id": "ffmpeg_source",
             "settings": {
-                "local_file": "C:\\Users\\ovoya\\shikosai-project\\CM\\mov_hts-samp001.mp4",
+                "local_file": "C:\\Users\\ovoya\\shikosai-project\\CM\\sample-5.mp4",
                 "looping": false
             },
             "mixers": 255,
@@ -768,6 +768,7 @@
             "id": "text_ft2_source",
             "versioned_id": "text_ft2_source_v2",
             "settings": {
+                "text": "to28 / end29",
                 "font": {
                     "face": "UD デジタル 教科書体 N",
                     "style": "Regular",
@@ -776,8 +777,7 @@
                 },
                 "antialiasing": true,
                 "color1": 4294967295,
-                "color2": 4294967295,
-                "text": "to64 / end65"
+                "color2": 4294967295
             },
             "mixers": 0,
             "sync": 0,
