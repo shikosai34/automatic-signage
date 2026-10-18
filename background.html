@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <style>
+    body, html {
+      margin: 0;
+      padding: 0;
+      width: 100vw;
+      height: 100vh;
+      background-color: #0B3041; /* ★ 指定サブカラーのダークネイビー */
+      overflow: hidden;
+    }
+
+    /* 六角形（ヘキサゴン）の幾何学模様 */
+    .hex-bg {
+      position: absolute;
+      width: 200vw;
+      height: 200vh;
+      top: -50vh;
+      left: -50vw;
+      /* うっすらとしたシアン(#00FFCC)の六角形パターン */
+      background-image: url("data:image/svg+xml,%3Csvg width='60' height='103.923' viewBox='0 0 60 103.923' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M30 0l30 17.32v34.64L30 69.28 0 51.96V17.32zM30 103.923l30-17.32V51.96L30 69.28 0 51.96v34.64z' fill='none' stroke='%2300FFCC' stroke-width='1.5' stroke-opacity='0.15'/%3E%3C/svg%3E");
+      animation: panBg 40s linear infinite;
+    }
+
+    /* ゆっくり斜めに動くアニメーション */
+    @keyframes panBg {
+      0% { transform: translate(0, 0); }
+      100% { transform: translate(60px, 103.923px); }
+    }
+
+    /* サイバーパンク風の走査線（スキャンライン） */
+    .scanlines {
+      position: absolute;
+      top: 0; left: 0;
+      width: 100vw; height: 100vh;
+      background: linear-gradient(to bottom, rgba(255,255,255,0), rgba(255,255,255,0) 50%, rgba(0, 255, 204, 0.05) 50%, rgba(0, 255, 204, 0.05));
+      background-size: 100% 4px;
+      pointer-events: none;
+    }
+
+    /* 下からふわっと光るメインカラー（オレンジ）のネオン */
+    .neon-glow {
+      position: absolute;
+      bottom: -20vh; left: 0;
+      width: 100vw; height: 40vh;
+      background: radial-gradient(ellipse at bottom, rgba(255, 153, 51, 0.15), transparent 70%);
+      pointer-events: none;
+    }
+
+    /* 画面の端を暗くしてテロップやパネルを目立たせる（ビネット効果） */
+    .vignette {
+      position: absolute;
+      top: 0; left: 0;
+      width: 100vw; height: 100vh;
+      background: radial-gradient(circle at center, transparent 30%, rgba(5, 20, 30, 0.8) 100%);
+      pointer-events: none;
+    }
+  </style>
+</head>
+<body>
+  <div class="hex-bg"></div>
+  <div class="scanlines"></div>
+  <div class="neon-glow"></div>
+  <div class="vignette"></div>
+</body>
+</html>

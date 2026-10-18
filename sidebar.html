@@ -2,7 +2,6 @@
 <html lang="ja">
 <head>
   <meta charset="UTF-8">
-  <!-- Google Fonts: Kiwi Maru の読み込み -->
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Kiwi+Maru:wght@400;500&display=swap" rel="stylesheet">
@@ -11,7 +10,6 @@
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
       background-color: transparent !important;
-      color: #E8E8E8;
       font-family: 'Kiwi Maru', serif;
       overflow: hidden;
       width: 100vw;
@@ -22,17 +20,17 @@
       padding: 0;
     }
 
-    /* 外側のパネル（枠線なし、指定の背景色） */
+    /* パネル全体：オレンジの塗りつぶしをなくし、サイバー風の細い枠線と余白で魅せるデザイン */
     .panel-card {
       width: 100%;
       height: 100%;
-      background: #0B3041;
-      border: none !important; /* ★ 枠線なし */
-      border-radius: 16px;
+      background: rgba(11, 48, 65, 0.85); /* ★ 背景はダークネイビーの半透明 */
+      border: 1.5px solid #FF9933 !important; /* ★ メインカラー（オレンジ）の細い枠線 */
+      border-radius: 12px;
       overflow: hidden;
-      box-shadow: none !important;
+      box-shadow: 0 0 15px rgba(255, 153, 51, 0.2) !important; /* うっすらオレンジに光るネオン */
       position: relative;
-      transition: background 0.4s ease;
+      transition: opacity 0.4s ease;
     }
 
     /* 画像単体の時は枠も背景も完全に透明 */
@@ -42,7 +40,6 @@
       box-shadow: none !important;
     }
 
-    /* コンテンツ全体 */
     .content-box {
       width: 100%;
       height: 100%;
@@ -50,23 +47,23 @@
       flex-direction: column;
       transition: opacity 0.4s ease;
       opacity: 1;
+      padding: 16px;
     }
-
-    .content-box.fade-out {
-      opacity: 0;
-    }
+    .content-box.fade-out { opacity: 0; }
 
     /* 1. タイトルエリア（上） */
     .title-container {
-      padding: 20px 20px 8px 20px;
-      background: #0B3041;
+      padding: 8px 4px 12px 4px;
+      background: transparent;
       flex-shrink: 0;
+      border-bottom: 1px dashed rgba(255, 153, 51, 0.4); /* オレンジの点線で上品に区切る */
+      margin-bottom: 10px;
     }
 
     .panel-title {
-      font-size: 26px;
+      font-size: 28px;
       font-weight: 500;
-      color: #E8E8E8; /* ★ 指定文字色 */
+      color: #E8E8E8; /* 文字は明るい白系 */
       line-height: 1.3;
       font-family: 'Kiwi Maru', serif;
     }
@@ -78,64 +75,54 @@
       display: flex;
       justify-content: center;
       align-items: center;
-      background: #0B3041;
+      background: transparent;
       overflow: hidden;
       min-height: 0;
-      padding: 10px 16px;
+      padding: 8px 0;
     }
 
     .image-container img {
       width: 100%;
       height: 100%;
       object-fit: contain;
-      border-radius: 8px;
+      border-radius: 6px;
     }
 
-    /* 画像単体の時は余白なし・角丸なし・完全透明 */
-    .image-only-mode .image-container {
-      padding: 0;
-      background: transparent !important;
-    }
-    .image-only-mode .image-container img {
-      border-radius: 0;
-    }
+    .image-only-mode .image-container { padding: 0; }
+    .image-only-mode .image-container img { border-radius: 0; }
 
     /* 3. 説明エリア（下） */
     .desc-container {
-      padding: 8px 20px 20px 20px;
-      background: #0B3041;
+      padding: 10px 4px 4px 4px;
+      background: transparent;
       flex-shrink: 0;
     }
 
     .panel-desc {
-      font-size: 18px;
-      color: #E8E8E8; /* ★ 指定文字色 */
+      font-size: 16px;
+      color: #E8E8E8;
+      font-weight: 400;
       line-height: 1.6;
       white-space: pre-wrap;
       font-family: 'Kiwi Maru', serif;
     }
 
-    /* --- 文章のみのレイアウト --- */
+    /* 文章のみのレイアウト */
     .text-only {
       justify-content: center;
       align-items: center;
       text-align: center;
       padding: 32px 24px;
     }
-
-    .text-only .title-container,
-    .text-only .desc-container {
-      padding: 0;
-      background: transparent;
-    }
-
-    .text-only .panel-title {
-      font-size: 32px;
+    .text-only .title-container {
+      border-bottom: none;
       margin-bottom: 16px;
     }
-
+    .text-only .panel-title {
+      font-size: 34px;
+    }
     .text-only .panel-desc {
-      font-size: 22px;
+      font-size: 20px;
     }
   </style>
 </head>
@@ -143,17 +130,12 @@
 
   <div id="card" class="panel-card" style="display:none;">
     <div id="contentBox" class="content-box">
-      <!-- 1. タイトル（上） -->
       <div id="titleBox" class="title-container">
         <div id="panelTitle" class="panel-title"></div>
       </div>
-
-      <!-- 2. 画像（中央） -->
       <div id="imgBox" class="image-container">
         <img id="panelImg" src="" alt="">
       </div>
-
-      <!-- 3. 説明文（下） -->
       <div id="descBox" class="desc-container">
         <div id="panelDesc" class="panel-desc"></div>
       </div>
@@ -216,45 +198,19 @@
           panelImg.src = item.image_data;
         } else if (hasImage) {
           card.className = "panel-card";
-
-          if (hasTitle) {
-            titleBox.style.display = "block";
-            panelTitle.innerText = item.title;
-          } else {
-            titleBox.style.display = "none";
-          }
-
+          if (hasTitle) { titleBox.style.display = "block"; panelTitle.innerText = item.title; } else { titleBox.style.display = "none"; }
           imgBox.style.display = "flex";
           panelImg.src = item.image_data;
-
-          if (hasDesc) {
-            descBox.style.display = "block";
-            panelDesc.innerText = item.description;
-          } else {
-            descBox.style.display = "none";
-          }
+          if (hasDesc) { descBox.style.display = "block"; panelDesc.innerText = item.description; } else { descBox.style.display = "none"; }
         } else {
           card.className = "panel-card";
           contentBox.classList.add('text-only');
           imgBox.style.display = "none";
-
-          if (hasTitle) {
-            titleBox.style.display = "block";
-            panelTitle.innerText = item.title;
-          } else {
-            titleBox.style.display = "none";
-          }
-
-          if (hasDesc) {
-            descBox.style.display = "block";
-            panelDesc.innerText = item.description;
-          } else {
-            descBox.style.display = "none";
-          }
+          if (hasTitle) { titleBox.style.display = "block"; panelTitle.innerText = item.title; } else { titleBox.style.display = "none"; }
+          if (hasDesc) { descBox.style.display = "block"; panelDesc.innerText = item.description; } else { descBox.style.display = "none"; }
         }
 
         contentBox.classList.remove('fade-out');
-
         currentIndex++;
         const duration = (item.duration || 10) * 1000;
 

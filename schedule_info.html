@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Kiwi+Maru:wght@400;500&display=swap" rel="stylesheet">
+
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body {
+      background-color: transparent !important;
+      overflow: hidden;
+      width: 100%;
+      height: 100%;
+      display: flex;
+      justify-content: flex-start;
+      align-items: center;
+      font-family: 'Kiwi Maru', serif;
+    }
+
+    .info-container {
+      display: flex;
+      gap: 16px;
+      align-items: center;
+      background: rgba(11, 48, 65, 0.75);
+      border: 1px solid rgba(255, 153, 51, 0.6);
+      border-radius: 8px;
+      padding: 8px 16px;
+      box-shadow: 0 4px 10px rgba(0, 0, 0, 0.4);
+      backdrop-filter: blur(4px);
+    }
+
+    .info-item {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 16px;
+      font-weight: 500;
+      color: #E8E8E8;
+    }
+
+    .info-label {
+      font-size: 13px;
+      color: #00FFCC;
+      font-weight: 400;
+      letter-spacing: 1px;
+    }
+
+    .info-time {
+      font-weight: 500;
+      color: #FF9933;
+      letter-spacing: 0.5px;
+    }
+
+    .divider {
+      width: 1px;
+      height: 20px;
+      background: rgba(255, 255, 255, 0.2);
+    }
+  </style>
+</head>
+<body>
+
+  <div class="info-container" id="infoBox">
+    <div class="info-item">
+      <span class="info-label">終了</span>
+      <span class="info-time" id="currEndTime">--:--</span>
+    </div>
+    <div class="divider"></div>
+    <div class="info-item">
+      <span class="info-label">次</span>
+      <span class="info-time" id="nextStartTime">次の予定なし</span>
+    </div>
+  </div>
+
+  <script>
+    const API_URL = 'https://shikosai-signage-api.shikosai.workers.dev/api/state';
+
+    function padTime(t) {
+      if (!t) return '';
+      const p = t.split(':');
+      return p.length === 2 ? ('0' + p[0]).slice(-2) + ':' + ('0' + p[1]).slice(-2) : t;
+    }
+
+    function getCurrentTimeStr() {
+      const now = new Date();
+      return String(now.getHours()).padStart(2, '0') + ':' + String(now.getMinutes()).padStart(2, '0');
+    }
+
+    async function fetchScheduleInfo() {
+      try {
+        const res = await fetch(API_URL + '?t=' + Date.now());
+        const data = await res.json();
+        const state = data.state || {};
+        const timetable = data.timetable || [];
+        const isAuto = state.is_auto !== 0;
+        const nowTime = getCurrentTimeStr();
+
+        let currentIndex = state.current_index;
+
+        // 自動進行が有効な場合、現在の時刻に合わせてインデックスを判定
+        if (isAuto) {
+          currentIndex = -1;
+          for (let i = 0; i < timetable.length; i++) {
+            const start = padTime(timetable[i].start_time);
+            const end = padTime(timetable[i].end_time);
+            if (nowTime >= start && nowTime < end) {
+              currentIndex = i;
+              break;
+            }
+          }
+        }
+
+        const currEndTimeEl = document.getElementById('currEndTime');
+        const nextStartTimeEl = document.getElementById('nextStartTime');
+
+        // 現在進行中の演目
+        if (currentIndex >= 0 && timetable[currentIndex]) {
+          const currItem = timetable[currentIndex];
+          currEndTimeEl.innerText = padTime(currItem.end_time) + " まで";
+        } else {
+          currEndTimeEl.innerText = "--:--";
+        }
+
+        // 次の演目を探索（現在時刻より後に開始するものを探す）
+        let nextItem = null;
+        if (currentIndex >= 0) {
+          if (currentIndex + 1 < timetable.length) {
+            nextItem = timetable[currentIndex + 1];
+          }
+        } else {
+          // 待機中または枠外の場合、現在時刻以降に始まる一番最初の演目を探す
+          for (let i = 0; i < timetable.length; i++) {
+            if (padTime(timetable[i].start_time) > nowTime) {
+              nextItem = timetable[i];
+              break;
+            }
+          }
+        }
+
+        if (nextItem) {
+          nextStartTimeEl.innerText = padTime(nextItem.start_time) + "〜 " + (nextItem.title || '');
+        } else {
+          nextStartTimeEl.innerText = "本日の全日程終了";
+        }
+      } catch (e) {
+        console.warn("スケジュール情報取得エラー:", e);
+      }
+    }
+
+    setInterval(fetchScheduleInfo, 3000);
+    fetchScheduleInfo();
+  </script>
+</body>
+</html>

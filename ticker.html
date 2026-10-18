@@ -32,11 +32,12 @@
       transform: translateY(-50%);
       white-space: nowrap;
       font-family: 'Kiwi Maru', serif;
-      font-size: 42px;
+      font-size: 60px;
       font-weight: 500;
       color: #E8E8E8;
-      text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.7);
-      visibility: hidden; /* ★ 画面外にセットされるまで完全に隠す（左端チラつき防止） */
+      /* ★ シアンのネオン発光エフェクトを追加 */
+      text-shadow: 0 0 10px #00FFCC, 0 0 20px #00FFCC, 2px 2px 4px rgba(0, 0, 0, 0.9);
+      visibility: hidden;
       will-change: transform;
     }
   </style>
@@ -46,15 +47,14 @@
   <div class="ticker-wrap" id="wrap"></div>
 
   <script>
-    const SCROLL_SPEED = 140; // 1秒に進むピクセル数
-    const GAP_BETWEEN = 160;  // 文字と文字の間のすき間（px）
+    const SCROLL_SPEED = 150;
+    const GAP_BETWEEN = 160;
 
     const wrap = document.getElementById('wrap');
     let lastTime = 0;
-    const queue = []; // 待機キュー
-    const activeItems = []; // 現在画面を流れている要素
+    const queue = [];
+    const activeItems = [];
 
-    // 1. Pythonからの新着テロップを監視してキューに追加
     function checkTicker() {
       const script = document.createElement('script');
       script.src = 'ticker_data.js?t=' + Date.now();
@@ -62,7 +62,6 @@
         script.remove();
         if (typeof latestTickerTime !== 'undefined' && latestTickerTime !== lastTime) {
           lastTime = latestTickerTime;
-          // 新しいテロップを待機リストに入れる
           queue.push(latestTickerText);
         }
       };
@@ -70,37 +69,28 @@
       document.body.appendChild(script);
     }
 
-    // 2. テロップを発進させる関数
     function spawnTicker(text) {
       const el = document.createElement('div');
       el.className = 'ticker-text';
       el.innerText = text;
       wrap.appendChild(el);
 
-      // 幅を計測
       const wrapWidth = wrap.clientWidth || window.innerWidth;
       const textWidth = el.scrollWidth;
 
-      // 最初は画面の右端外側に配置して表示開始
       let currentX = wrapWidth;
       el.style.transform = `translate3d(${currentX}px, -50%, 0)`;
       el.style.visibility = 'visible';
 
-      activeItems.push({
-        el: el,
-        x: currentX,
-        width: textWidth
-      });
+      activeItems.push({ el: el, x: currentX, width: textWidth });
     }
 
-    // 3. 毎フレーム実行される高精度スクロールループ（requestAnimationFrame）
     let lastTimestamp = null;
     function animateLoop(timestamp) {
       if (!lastTimestamp) lastTimestamp = timestamp;
       const deltaTime = (timestamp - lastTimestamp) / 1000;
       lastTimestamp = timestamp;
 
-      // 画面上の全文字を左へ移動
       const moveDistance = SCROLL_SPEED * deltaTime;
 
       for (let i = activeItems.length - 1; i >= 0; i--) {
@@ -108,27 +98,21 @@
         item.x -= moveDistance;
         item.el.style.transform = `translate3d(${item.x}px, -50%, 0)`;
 
-        // 左端の外に完全に抜けきったら削除
         if (item.x + item.width < -100) {
           item.el.remove();
           activeItems.splice(i, 1);
         }
       }
 
-      // ★ 次のテロップを発進できるか判定（干渉チェック）
       if (queue.length > 0) {
         const wrapWidth = wrap.clientWidth || window.innerWidth;
         let canSpawn = false;
 
         if (activeItems.length === 0) {
-          // 画面に何も流れていなければ即座に発進
           canSpawn = true;
         } else {
-          // 直前に流した文字のお尻（右端の位置）をチェック
           const lastItem = activeItems[activeItems.length - 1];
           const lastItemRightEdge = lastItem.x + lastItem.width;
-
-          // 前の文字のお尻が画面内に入り、指定した隙間（GAP_BETWEEN）が空いたら発進
           if (lastItemRightEdge <= wrapWidth - GAP_BETWEEN) {
             canSpawn = true;
           }
@@ -143,7 +127,6 @@
       requestAnimationFrame(animateLoop);
     }
 
-    // 監視とアニメーション開始
     setInterval(checkTicker, 400);
     requestAnimationFrame(animateLoop);
   </script>

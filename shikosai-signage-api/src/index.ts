@@ -9,17 +9,14 @@ type Bindings = {
 const app = new Hono<{ Bindings: Bindings }>()
 app.use('*', cors())
 
-// サーバー起動確認
 app.get('/', (c) => {
   return c.text('Shikosai Signage API is running!')
 })
 
-// 管理画面
 app.get('/admin', (c) => {
   return c.html(HTML_ADMIN_PAGE)
 })
 
-// 共通処理: 時刻のゼロ埋め（8:00 -> 08:00）
 const padTimeStr = (t: string) => {
   if (!t) return '';
   const p = t.split(':');
@@ -31,21 +28,23 @@ const padTimeStr = (t: string) => {
 // ==========================================
 app.get('/api/state', async (c) => {
   try {
-    const { results: timetable } = await c.env.DB.prepare(
-      'SELECT * FROM timetable ORDER BY start_time ASC, id ASC'
-    ).all()
-    
     let state: any = null
     try {
       state = await c.env.DB.prepare('SELECT * FROM app_state WHERE id = 1').first()
     } catch (_) {}
     
     if (!state) {
-      state = { current_index: -1, is_auto: 1, wait_cm: 0 }
+      state = { current_index: -1, is_auto: 1, wait_cm: 0, current_day: 1 }
     }
+
+    const currentDay = state.current_day || 1
+    const { results: timetable } = await c.env.DB.prepare(
+      'SELECT * FROM timetable WHERE day = ? ORDER BY start_time ASC, id ASC'
+    ).bind(currentDay).all()
+    
     return c.json({ state, timetable: timetable || [] })
   } catch (e: any) {
-    return c.json({ state: { current_index: -1, is_auto: 1, wait_cm: 0 }, timetable: [] })
+    return c.json({ state: { current_index: -1, is_auto: 1, wait_cm: 0, current_day: 1 }, timetable: [] })
   }
 })
 
@@ -55,6 +54,10 @@ app.post('/api/state/update', async (c) => {
     const updates: string[] = []
     const values: any[] = []
     
+    if (body.current_day !== undefined) {
+      updates.push('current_day = ?')
+      values.push(body.current_day)
+    }
     if (body.current_index !== undefined) {
       updates.push('current_index = ?')
       values.push(body.current_index)
@@ -84,44 +87,29 @@ app.post('/api/state/update', async (c) => {
 // 1. テロップ用 API
 // ==========================================
 app.get('/api/info', async (c) => {
-  const { results } = await c.env.DB.prepare(
-    'SELECT * FROM info WHERE is_active = 1 ORDER BY id DESC'
-  ).all()
+  const { results } = await c.env.DB.prepare('SELECT * FROM info WHERE is_active = 1 ORDER BY id DESC').all()
   return c.json(results || [])
 })
-
 app.get('/api/info/all', async (c) => {
-  const { results } = await c.env.DB.prepare(
-    'SELECT * FROM info ORDER BY is_active DESC, id DESC'
-  ).all()
+  const { results } = await c.env.DB.prepare('SELECT * FROM info ORDER BY is_active DESC, id DESC').all()
   return c.json(results || [])
 })
-
 app.post('/api/info', async (c) => {
   const body = await c.req.json()
   const rawText = body.raw_text || body.text || ''
   const formattedText = body.formatted_text || rawText
   const tag = body.tag || 'その他'
   const isActive = body.is_active !== undefined ? (body.is_active ? 1 : 0) : 1
-
-  await c.env.DB.prepare(
-    'INSERT INTO info (raw_text, formatted_text, tag, frequency, is_active) VALUES (?, ?, ?, 1, ?)'
-  ).bind(rawText, formattedText, tag, isActive).run()
-
+  await c.env.DB.prepare('INSERT INTO info (raw_text, formatted_text, tag, frequency, is_active) VALUES (?, ?, ?, 1, ?)')
+    .bind(rawText, formattedText, tag, isActive).run()
   return c.json({ success: true })
 })
-
 app.post('/api/info/update', async (c) => {
   const body = await c.req.json()
-  const { id, formatted_text, tag, is_active } = body
-
-  await c.env.DB.prepare(
-    'UPDATE info SET formatted_text = ?, tag = ?, is_active = ? WHERE id = ?'
-  ).bind(formatted_text, tag, is_active ? 1 : 0, id).run()
-
+  await c.env.DB.prepare('UPDATE info SET formatted_text = ?, tag = ?, is_active = ? WHERE id = ?')
+    .bind(body.formatted_text, body.tag, body.is_active ? 1 : 0, body.id).run()
   return c.json({ success: true })
 })
-
 app.post('/api/info/delete', async (c) => {
   const body = await c.req.json()
   await c.env.DB.prepare('DELETE FROM info WHERE id = ?').bind(body.id).run()
@@ -133,9 +121,7 @@ app.post('/api/info/delete', async (c) => {
 // ==========================================
 app.get('/api/timetable', async (c) => {
   try {
-    const { results } = await c.env.DB.prepare(
-      'SELECT * FROM timetable ORDER BY start_time ASC, id ASC'
-    ).all()
+    const { results } = await c.env.DB.prepare('SELECT * FROM timetable ORDER BY day ASC, start_time ASC, id ASC').all()
     return c.json(results || [])
   } catch (e: any) {
     return c.json({ error: e.message }, 500)
@@ -143,52 +129,46 @@ app.get('/api/timetable', async (c) => {
 })
 
 app.post('/api/timetable', async (c) => {
-  const body = await c.req.json()
-  const startTime = padTimeStr(body.start_time || '')
-  const endTime = padTimeStr(body.end_time || '')
-  const title = body.title || ''
-  const band = body.band || ''
-  const type = body.type || 'song'
+  try {
+    const body = await c.req.json()
+    const day = body.day || 1
+    const startTime = padTimeStr(body.start_time || '')
+    const endTime = padTimeStr(body.end_time || '')
+    const title = body.title || ''
+    const band = body.band || ''
+    const type = body.type || 'song'
 
-  if (!startTime || !endTime) {
-    return c.json({ error: "開始時刻と終了時刻を指定してください" }, 400)
+    if (!startTime || !endTime) return c.json({ error: "開始時刻と終了時刻を指定してください" }, 400)
+    if (startTime >= endTime) return c.json({ error: "終了時刻は開始時刻より後に設定してください" }, 400)
+
+    const { results: overlaps } = await c.env.DB.prepare(
+      'SELECT title, start_time, end_time FROM timetable WHERE day = ? AND ? < end_time AND ? > start_time'
+    ).bind(day, startTime, endTime).all()
+
+    if (overlaps && overlaps.length > 0) {
+      const conflict: any = overlaps[0]
+      return c.json({ error: `時間が重複しています（既存: ${conflict.start_time}〜${conflict.end_time} 「${conflict.title}」）` }, 400)
+    }
+
+    await c.env.DB.prepare(
+      'INSERT INTO timetable (day, start_time, end_time, title, band, type) VALUES (?, ?, ?, ?, ?, ?)'
+    ).bind(day, startTime, endTime, title, band, type).run()
+
+    return c.json({ success: true })
+  } catch (e: any) {
+    return c.json({ error: e.message }, 500)
   }
-
-  if (startTime >= endTime) {
-    return c.json({ error: "終了時刻は開始時刻より後に設定してください" }, 400)
-  }
-
-  const { results: overlaps } = await c.env.DB.prepare(
-    'SELECT title, start_time, end_time FROM timetable WHERE ? < end_time AND ? > start_time'
-  ).bind(startTime, endTime).all()
-
-  if (overlaps && overlaps.length > 0) {
-    const conflict: any = overlaps[0]
-    return c.json({ 
-      error: `時間が重複しています（既存: ${conflict.start_time}〜${conflict.end_time} 「${conflict.title}」）` 
-    }, 400)
-  }
-
-  await c.env.DB.prepare(
-    'INSERT INTO timetable (start_time, end_time, title, band, type) VALUES (?, ?, ?, ?, ?)'
-  ).bind(startTime, endTime, title, band, type).run()
-
-  return c.json({ success: true })
 })
 
 app.post('/api/timetable/batch', async (c) => {
   try {
     const body = await c.req.json()
-    const { items, overwrite } = body as {
-      items: Array<{ start_time: string; end_time: string; title: string; band?: string; type?: string }>
-      overwrite?: boolean
-    }
+    const { items, overwrite, day } = body as any
+    const targetDay = day || 1
 
-    if (!items || !Array.isArray(items) || items.length === 0) {
-      return c.json({ error: "インポートするデータがありません" }, 400)
-    }
+    if (!items || !Array.isArray(items) || items.length === 0) return c.json({ error: "データがありません" }, 400)
 
-    items.forEach(item => {
+    items.forEach((item: any) => {
       item.start_time = padTimeStr(item.start_time)
       item.end_time = padTimeStr(item.end_time)
     })
@@ -196,33 +176,18 @@ app.post('/api/timetable/batch', async (c) => {
     const sorted = [...items].sort((a, b) => a.start_time.localeCompare(b.start_time))
     for (let i = 0; i < sorted.length; i++) {
       const curr = sorted[i]
-      if (!curr.start_time || !curr.end_time || !curr.title) {
-        return c.json({ error: `「${curr.title || '無題'}」の入力内容を確認してください` }, 400)
-      }
-      if (curr.start_time >= curr.end_time) {
-        return c.json({ error: `「${curr.title}」の終了時刻が開始時刻より前または同じです` }, 400)
-      }
-      if (i > 0) {
-        const prev = sorted[i - 1]
-        if (curr.start_time < prev.end_time) {
-          return c.json({
-            error: `インポートデータ内で時間が重複しています（「${prev.title}」と「${curr.title}」）`
-          }, 400)
-        }
-      }
+      if (!curr.start_time || !curr.end_time || !curr.title) return c.json({ error: `「${curr.title || '無題'}」の入力内容を確認してください` }, 400)
+      if (curr.start_time >= curr.end_time) return c.json({ error: `「${curr.title}」の終了時刻が開始時刻より前です` }, 400)
+      if (i > 0 && curr.start_time < sorted[i - 1].end_time) return c.json({ error: `データ内で時間が重複しています（「${sorted[i-1].title}」と「${curr.title}」）` }, 400)
     }
 
     if (!overwrite) {
-      const { results: existing } = await c.env.DB.prepare('SELECT title, start_time, end_time FROM timetable').all()
+      const { results: existing } = await c.env.DB.prepare('SELECT title, start_time, end_time FROM timetable WHERE day = ?').bind(targetDay).all()
       if (existing && existing.length > 0) {
         for (const item of items) {
           for (const ex of existing as any[]) {
-            const exStart = padTimeStr(ex.start_time as string)
-            const exEnd = padTimeStr(ex.end_time as string)
-            if (item.start_time < exEnd && item.end_time > exStart) {
-              return c.json({
-                error: `既存の企画「${ex.title}」(${ex.start_time}〜${ex.end_time}) と重複しています`
-              }, 400)
+            if (item.start_time < padTimeStr(ex.end_time as string) && item.end_time > padTimeStr(ex.start_time as string)) {
+              return c.json({ error: `既存の「${ex.title}」(${ex.start_time}〜${ex.end_time}) と重複しています` }, 400)
             }
           }
         }
@@ -230,64 +195,46 @@ app.post('/api/timetable/batch', async (c) => {
     }
 
     const stmts = []
-    if (overwrite) {
-      stmts.push(c.env.DB.prepare('DELETE FROM timetable'))
-    }
-
+    if (overwrite) stmts.push(c.env.DB.prepare('DELETE FROM timetable WHERE day = ?').bind(targetDay))
+    
     for (const item of sorted) {
-      stmts.push(
-        c.env.DB.prepare(
-          'INSERT INTO timetable (start_time, end_time, title, band, type) VALUES (?, ?, ?, ?, ?)'
-        ).bind(
-          item.start_time,
-          item.end_time,
-          item.title,
-          item.band || '',
-          item.type || 'song'
-        )
-      )
+      stmts.push(c.env.DB.prepare('INSERT INTO timetable (day, start_time, end_time, title, band, type) VALUES (?, ?, ?, ?, ?, ?)')
+        .bind(targetDay, item.start_time, item.end_time, item.title, item.band || '', item.type || 'song'))
     }
 
     await c.env.DB.batch(stmts)
     return c.json({ success: true, count: sorted.length })
   } catch (e: any) {
-    return c.json({ error: e.message || '一括インポートに失敗しました' }, 500)
+    return c.json({ error: e.message }, 500)
   }
 })
 
 app.post('/api/timetable/update', async (c) => {
-  const body = await c.req.json()
-  const id = body.id
-  const start_time = padTimeStr(body.start_time)
-  const end_time = padTimeStr(body.end_time)
-  const title = body.title
-  const band = body.band
-  const type = body.type
+  try {
+    const body = await c.req.json()
+    const { id, day, title, band, type } = body
+    const start_time = padTimeStr(body.start_time)
+    const end_time = padTimeStr(body.end_time)
+    const targetDay = day || 1
 
-  if (!start_time || !end_time) {
-    return c.json({ error: "開始時刻と終了時刻を指定してください" }, 400)
+    if (!start_time || !end_time) return c.json({ error: "時刻を指定してください" }, 400)
+    if (start_time >= end_time) return c.json({ error: "終了時刻は開始時刻より後に設定してください" }, 400)
+
+    const { results: overlaps } = await c.env.DB.prepare(
+      'SELECT title, start_time, end_time FROM timetable WHERE day = ? AND ? < end_time AND ? > start_time AND id != ?'
+    ).bind(targetDay, start_time, end_time, id).all()
+
+    if (overlaps && overlaps.length > 0) {
+      const conflict: any = overlaps[0]
+      return c.json({ error: `時間が重複しています（既存: ${conflict.start_time}〜${conflict.end_time} 「${conflict.title}」）` }, 400)
+    }
+
+    await c.env.DB.prepare('UPDATE timetable SET day = ?, start_time = ?, end_time = ?, title = ?, band = ?, type = ? WHERE id = ?')
+      .bind(targetDay, start_time, end_time, title, band, type, id).run()
+    return c.json({ success: true })
+  } catch (e: any) {
+    return c.json({ error: e.message }, 500)
   }
-
-  if (start_time >= end_time) {
-    return c.json({ error: "終了時刻は開始時刻より後に設定してください" }, 400)
-  }
-
-  const { results: overlaps } = await c.env.DB.prepare(
-    'SELECT title, start_time, end_time FROM timetable WHERE ? < end_time AND ? > start_time AND id != ?'
-  ).bind(start_time, end_time, id).all()
-
-  if (overlaps && overlaps.length > 0) {
-    const conflict: any = overlaps[0]
-    return c.json({ 
-      error: `時間が重複しています（既存: ${conflict.start_time}〜${conflict.end_time} 「${conflict.title}」）` 
-    }, 400)
-  }
-
-  await c.env.DB.prepare(
-    'UPDATE timetable SET start_time = ?, end_time = ?, title = ?, band = ?, type = ? WHERE id = ?'
-  ).bind(start_time, end_time, title, band, type, id).run()
-
-  return c.json({ success: true })
 })
 
 app.post('/api/timetable/delete', async (c) => {
@@ -297,19 +244,16 @@ app.post('/api/timetable/delete', async (c) => {
 })
 
 app.post('/api/timetable/delete_range', async (c) => {
-  const body = await c.req.json()
-  const start_time = padTimeStr(body.start_time)
-  const end_time = padTimeStr(body.end_time)
-
-  if (!start_time || !end_time) {
-    return c.json({ error: "時刻を指定してください" }, 400)
-  }
-  if (start_time >= end_time) {
-    return c.json({ error: "終了時刻は開始時刻より後に設定してください" }, 400)
-  }
-
   try {
-    const { results } = await c.env.DB.prepare('SELECT id, start_time, end_time FROM timetable').all()
+    const body = await c.req.json()
+    const targetDay = body.day || 1
+    const start_time = padTimeStr(body.start_time)
+    const end_time = padTimeStr(body.end_time)
+
+    if (!start_time || !end_time) return c.json({ error: "時刻を指定してください" }, 400)
+    if (start_time >= end_time) return c.json({ error: "終了時刻は開始時刻より後に設定してください" }, 400)
+
+    const { results } = await c.env.DB.prepare('SELECT id, start_time, end_time FROM timetable WHERE day = ?').bind(targetDay).all()
     if (!results || results.length === 0) return c.json({ success: true })
 
     const idsToDelete = results.filter((row: any) => {
@@ -322,7 +266,6 @@ app.post('/api/timetable/delete_range', async (c) => {
       const placeholders = idsToDelete.map(() => '?').join(',')
       await c.env.DB.prepare(`DELETE FROM timetable WHERE id IN (${placeholders})`).bind(...idsToDelete).run()
     }
-
     return c.json({ success: true, count: idsToDelete.length })
   } catch (e: any) {
     return c.json({ error: e.message }, 500)
@@ -330,83 +273,54 @@ app.post('/api/timetable/delete_range', async (c) => {
 })
 
 // ==========================================
-// 3. 右側パネル用 API
+// 3. 右側パネル用 & 4. AI用
 // ==========================================
 app.get('/api/sidebar', async (c) => {
   try {
-    const { results } = await c.env.DB.prepare(
-      'SELECT * FROM sidebar_items WHERE is_active = 1 ORDER BY id DESC'
-    ).all()
+    const { results } = await c.env.DB.prepare('SELECT * FROM sidebar_items WHERE is_active = 1 ORDER BY id DESC').all()
     return c.json(results || [])
   } catch (e: any) {
     return c.json({ error: e.message }, 500)
   }
 })
-
 app.get('/api/sidebar/all', async (c) => {
   try {
-    const { results } = await c.env.DB.prepare(
-      'SELECT * FROM sidebar_items ORDER BY is_active DESC, id DESC'
-    ).all()
+    const { results } = await c.env.DB.prepare('SELECT * FROM sidebar_items ORDER BY is_active DESC, id DESC').all()
     return c.json(results || [])
   } catch (e: any) {
     return c.json({ error: e.message }, 500)
   }
 })
-
 app.post('/api/sidebar', async (c) => {
   try {
     const body = await c.req.json()
-    const title = body.title || ''
-    const description = body.description || ''
-    const imageData = body.image_data || ''
-    const duration = body.duration ? Number(body.duration) : 10
-    const isActive = body.is_active !== undefined ? (body.is_active ? 1 : 0) : 1
-
-    await c.env.DB.prepare(
-      'INSERT INTO sidebar_items (title, description, image_data, duration, is_active) VALUES (?, ?, ?, ?, ?)'
-    ).bind(title, description, imageData, duration, isActive).run()
-
+    await c.env.DB.prepare('INSERT INTO sidebar_items (title, description, image_data, duration, is_active) VALUES (?, ?, ?, ?, ?)')
+      .bind(body.title||'', body.description||'', body.image_data||'', Number(body.duration)||10, body.is_active!==undefined?(body.is_active?1:0):1).run()
     return c.json({ success: true })
   } catch (e: any) {
     return c.json({ error: e.message }, 500)
   }
 })
-
 app.post('/api/sidebar/update', async (c) => {
   try {
     const body = await c.req.json()
-    const { id, title, description, duration, is_active } = body
-
-    if (title !== undefined && description !== undefined) {
-      await c.env.DB.prepare(
-        'UPDATE sidebar_items SET title = ?, description = ?, duration = ?, is_active = ? WHERE id = ?'
-      ).bind(title, description, Number(duration || 10), is_active ? 1 : 0, id).run()
-    } else if (is_active !== undefined) {
-      await c.env.DB.prepare(
-        'UPDATE sidebar_items SET is_active = ? WHERE id = ?'
-      ).bind(is_active ? 1 : 0, id).run()
+    if (body.title !== undefined) {
+      await c.env.DB.prepare('UPDATE sidebar_items SET title=?, description=?, duration=?, is_active=? WHERE id=?')
+        .bind(body.title, body.description, Number(body.duration)||10, body.is_active?1:0, body.id).run()
+    } else {
+      await c.env.DB.prepare('UPDATE sidebar_items SET is_active=? WHERE id=?').bind(body.is_active?1:0, body.id).run()
     }
-
     return c.json({ success: true })
   } catch (e: any) {
     return c.json({ error: e.message }, 500)
   }
 })
-
 app.post('/api/sidebar/delete', async (c) => {
-  try {
-    const body = await c.req.json()
-    await c.env.DB.prepare('DELETE FROM sidebar_items WHERE id = ?').bind(body.id).run()
-    return c.json({ success: true })
-  } catch (e: any) {
-    return c.json({ error: e.message }, 500)
-  }
+  const body = await c.req.json()
+  await c.env.DB.prepare('DELETE FROM sidebar_items WHERE id=?').bind(body.id).run()
+  return c.json({ success: true })
 })
 
-// ==========================================
-// 4. AI整形 API
-// ==========================================
 app.post('/api/format', async (c) => {
   try {
     const body = await c.req.json()
@@ -420,14 +334,12 @@ app.post('/api/format', async (c) => {
       "以下の連絡文を、画面下部に流すための簡潔で分かりやすい「テロップ用テキスト」に整形してください。\n\n" +
       "【ルール】\n" +
       "- 25文字〜40文字程度の日本語1行で出力すること。\n" +
-      "- 先頭に必ず適切な角括弧タグを付けること（例: 【お知らせ】、【完売情報】、【落とし物】、【イベント】など）。\n" +
+      "- 先頭に必ず適切な角括弧タグを付けること。\n" +
       "- 絵文字や挨拶文は削除すること。\n" +
       "- 整形後のテキストのみを出力し、解説や前置きは一切出力しないこと。\n\n" +
       "【連絡文】\n" + rawText
 
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-pro-preview:generateContent?key=${apiKey}`
-
-    const response = await fetch(url, {
+    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-pro-preview:generateContent?key=${apiKey}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -512,7 +424,7 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
     .control-slot-next { background: #0f172a; border-left: 4px solid #3b82f6; }
     .c-title { font-size: 18px; font-weight: bold; margin: 4px 0; word-break: break-all; }
     .c-sub { font-size: 13px; color: #e2e8f0; word-break: break-all; }
-    .setting-box { background: #0f172a; border: 1px solid #334155; padding: 14px; border-radius: 10px; display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; gap: 10px; }
+    .setting-box { background: #0f172a; border: 1px solid #334155; padding: 14px; border-radius: 10px; display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; gap: 10px; }
     
     .switch-container { display: flex; align-items: center; gap: 10px; }
     .switch { position: relative; display: inline-block; width: 44px; height: 24px; flex-shrink: 0; }
@@ -522,7 +434,6 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
     input:checked + .slider { background-color: #10b981; }
     input:checked + .slider:before { transform: translateX(20px); }
 
-    /* スマホ対応（レスポンシブリスト） */
     .ctrl-item-card { background: #0f172a; padding: 12px; border-radius: 8px; margin-bottom: 8px; border-left: 4px solid #64748b; font-size: 14px; display: flex; flex-direction: column; gap: 4px; }
     .ctrl-item-card.active { background: #0369a1; border-left-color: #38bdf8; }
     .ctrl-item-row { display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; }
@@ -551,6 +462,17 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
     <div id="tabContentControl">
       <div class="card">
         <h2 style="margin-bottom: 16px;">🎮 OBSステージ進行状態</h2>
+
+        <div class="setting-box" style="background: rgba(3, 105, 161, 0.4); border-color: #0284c7;">
+          <div>
+            <div style="font-weight:bold; font-size:14px; margin-bottom:2px; color:#e0f2fe;">🗓️ 配信日程の選択</div>
+            <div style="font-size:11px; color:#bae6fd;">現在OBSに連動させるタイムテーブルの日程</div>
+          </div>
+          <div style="display:flex; gap:8px;">
+            <button id="btnCtrlDay1" class="btn" style="padding:8px 16px; border-radius:8px;" onclick="changeCurrentDay(1)">1日目</button>
+            <button id="btnCtrlDay2" class="btn btn-secondary" style="padding:8px 16px; border-radius:8px;" onclick="changeCurrentDay(2)">2日目</button>
+          </div>
+        </div>
         
         <div class="setting-box">
           <div>
@@ -636,9 +558,15 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
 
     <!-- タブ2: タイムテーブル管理 -->
     <div id="tabContentTimetable" style="display:none;">
+      
+      <div style="display:flex; gap:8px; margin-bottom:12px;">
+        <button id="btnEditDay1" class="btn" style="flex:1; border-radius:8px;" onclick="setEditDay(1)">📅 1日目</button>
+        <button id="btnEditDay2" class="btn btn-secondary" style="flex:1; border-radius:8px;" onclick="setEditDay(2)">📅 2日目</button>
+      </div>
+
       <div class="card">
         <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; flex-wrap:wrap; gap:8px;">
-          <h2 style="margin:0;">📅 タイムスケジュール</h2>
+          <h2 style="margin:0;">📅 新規登録 (<span id="txtEditDayLabel">1日目</span>)</h2>
           <div style="display:flex; gap:6px;">
             <button class="btn btn-secondary" style="background:#b91c1c; padding:6px 10px;" onclick="openDeleteRangeModal()">🗑️ 範囲削除</button>
             <button class="btn btn-secondary" style="padding:6px 10px;" onclick="openImportModal()">📋 一括インポート</button>
@@ -676,10 +604,10 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
 
       <div class="card" style="margin-top:16px;">
         <div style="display:flex; justify-content:space-between; align-items:center;">
-          <h3>📋 本日のタイムテーブル一覧</h3>
+          <h3 style="margin:0;">📋 登録済み一覧 (<span id="txtListDayLabel">1日目</span>)</h3>
           <button class="btn" style="padding:6px 12px; font-size:12px; background:#334155;" onclick="loadTimetableList()">↻ 更新</button>
         </div>
-        <div id="timetableList" class="list-container">読み込み中...</div>
+        <div id="timetableList" class="list-container" style="margin-top:12px;">読み込み中...</div>
       </div>
     </div>
 
@@ -721,7 +649,7 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
   <div class="modal-overlay" id="deleteRangeModal">
     <div class="modal-card" style="max-width: 450px;">
       <div class="modal-header">
-        <h3 style="margin:0;">🗑️ 指定範囲のタイムテーブル削除</h3>
+        <h3 style="margin:0;">🗑️ 指定範囲の削除 (<span id="lblDelModalDay">1日目</span>)</h3>
         <button style="background:transparent; border:none; color:#94a3b8; font-size:24px; cursor:pointer;" onclick="closeDeleteRangeModal()">&times;</button>
       </div>
       <div class="modal-body">
@@ -750,14 +678,13 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
   <div class="modal-overlay" id="importModal">
     <div class="modal-card">
       <div class="modal-header">
-        <h3 style="margin:0;">📋 タイムテーブルの一括インポート</h3>
+        <h3 style="margin:0;">📋 一括インポート (<span id="lblImpModalDay">1日目</span>)</h3>
         <button style="background:transparent; border:none; color:#94a3b8; font-size:24px; cursor:pointer;" onclick="closeImportModal()">&times;</button>
       </div>
       <div class="modal-body">
         <div class="guide-box">
           💡 <strong>Excel / Googleスプレッドシートからそのままコピー＆貼り付けできます</strong><br>
           列の順番: <code>[開始時刻]   [終了時刻]   [企画]   [詳細]   [種別]</code><br>
-          ※詳細・種別（ステージ/幕間）は省略可能です。
         </div>
 
         <div class="form-group">
@@ -803,8 +730,10 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
     var parsedBatchItems = [];
     var selectedImageData = '';
     
-    var gState = { current_index: -1, is_auto: 1, wait_cm: 0 };
+    var gState = { current_index: -1, is_auto: 1, wait_cm: 0, current_day: 1 };
     var gTimetable = [];
+    var gAllTimetable = [];
+    var currentEditDay = 1;
 
     function padTime(t) {
       if (!t) return '';
@@ -830,13 +759,9 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
         var t = tabs[i];
         var cap = t.charAt(0).toUpperCase() + t.slice(1);
         var contentEl = document.getElementById('tabContent' + cap);
-        if (contentEl) {
-          contentEl.style.display = (t === tab) ? 'block' : 'none';
-        }
+        if (contentEl) contentEl.style.display = (t === tab) ? 'block' : 'none';
         var btnEl = document.getElementById('tabBtn' + cap);
-        if (btnEl) {
-          btnEl.className = 'tab-btn' + (t === tab ? ' active' : '');
-        }
+        if (btnEl) btnEl.className = 'tab-btn' + (t === tab ? ' active' : '');
       }
 
       if (tab === 'ticker') loadTickerList();
@@ -845,11 +770,12 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
       if (tab === 'control') fetchState();
     }
 
+    // --- 進行コントロール ---
     async function fetchState() {
       try {
         var res = await fetch(API_BASE + '/api/state');
         var data = await res.json();
-        gState = data.state || { current_index: -1, is_auto: 1, wait_cm: 0 };
+        gState = data.state || { current_index: -1, is_auto: 1, wait_cm: 0, current_day: 1 };
         gTimetable = data.timetable || [];
         
         var chkAuto = document.getElementById('chkAutoMode');
@@ -868,15 +794,39 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
           lblWait.style.color = gState.wait_cm ? "#10b981" : "#94a3b8";
         }
 
+        var btn1 = document.getElementById('btnCtrlDay1');
+        var btn2 = document.getElementById('btnCtrlDay2');
+        if (gState.current_day === 1) {
+          btn1.className = 'btn'; btn1.style.background = '#2563eb';
+          btn2.className = 'btn btn-secondary'; btn2.style.background = '#475569';
+        } else {
+          btn2.className = 'btn'; btn2.style.background = '#2563eb';
+          btn1.className = 'btn btn-secondary'; btn1.style.background = '#475569';
+        }
+
         renderControlUI();
-      } catch (e) { console.error("State Fetch Error", e); }
+      } catch (e) {}
+    }
+
+    async function changeCurrentDay(d) {
+      if (gState.current_day === d) return;
+      if (!confirm(d + "日目に配信を切り替えますか？\\n※進行状況はリセットされます")) return;
+      
+      try {
+        await fetch(API_BASE + '/api/state/update', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ current_day: Number(d), current_index: -1 })
+        });
+        showToast(d + "日目に切り替えました", false);
+        fetchState();
+      } catch(e) {
+        showToast("❌ 通信エラー: " + e.message, true);
+      }
     }
 
     async function updateStateSetting() {
-      var chkAuto = document.getElementById('chkAutoMode');
-      var chkWait = document.getElementById('chkWaitCm');
-      var isAuto = chkAuto ? chkAuto.checked : true;
-      var waitCm = chkWait ? chkWait.checked : false;
+      var isAuto = document.getElementById('chkAutoMode').checked;
+      var waitCm = document.getElementById('chkWaitCm').checked;
       await fetch(API_BASE + '/api/state/update', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ is_auto: isAuto, wait_cm: waitCm })
@@ -935,26 +885,18 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
         }
       }
 
-      // ★演目進行リストのスマホ対応＆「種別 / 企画 / 詳細」表示
       var listEl = document.getElementById('ctrl-timetable-list');
       if (listEl && gTimetable) {
         listEl.innerHTML = '';
         gTimetable.forEach(function(item, i) {
           var card = document.createElement('div');
           card.className = 'ctrl-item-card ' + (i === idx ? 'active' : '');
-          
           var isSong = (item.type === 'song' || item.type === 'ステージ（演奏・企画）');
-          var typeBadge = isSong ? '<span class="tag tag-song">ステージ</span>' : '<span class="tag tag-break">幕間CM</span>';
-          var timeStr = padTime(item.start_time) + ' 〜 ' + padTime(item.end_time);
-
           card.innerHTML = 
-            '<div class="ctrl-item-row">' +
-              '<span class="ctrl-time">🕒 ' + timeStr + '</span>' +
-              typeBadge +
-            '</div>' +
+            '<div class="ctrl-item-row"><span class="ctrl-time">🕒 ' + padTime(item.start_time) + ' 〜 ' + padTime(item.end_time) + '</span>' +
+            (isSong ? '<span class="tag tag-song">ステージ</span>' : '<span class="tag tag-break">幕間CM</span>') + '</div>' +
             '<div class="ctrl-title">' + escapeHtml(item.title || '') + '</div>' +
             (item.band ? '<div class="ctrl-band">詳細: ' + escapeHtml(item.band) + '</div>' : '');
-
           listEl.appendChild(card);
         });
       }
@@ -962,9 +904,7 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
 
     setInterval(function() {
       var ctrlBox = document.getElementById('tabContentControl');
-      if (ctrlBox && ctrlBox.style.display !== 'none') {
-        fetchState();
-      }
+      if (ctrlBox && ctrlBox.style.display !== 'none') fetchState();
     }, 2000);
 
     // --- テロップ管理 ---
@@ -977,18 +917,13 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
 
       if (!rawText) return alert("文章を入力してください");
       submitBtn.disabled = true;
-      status.style.color = "#38bdf8";
-      status.innerText = "処理中...";
+      status.style.color = "#38bdf8"; status.innerText = "処理中...";
 
       var formattedText = rawText;
       if (!tag.includes("（そのまま）")) {
         try {
           status.innerText = "AIがテロップを成形中...";
-          var aiRes = await fetch(API_BASE + '/api/format', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ text: rawText })
-          });
+          var aiRes = await fetch(API_BASE + '/api/format', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text: rawText }) });
           var aiData = await aiRes.json();
           if (aiData.formatted_text) formattedText = aiData.formatted_text;
         } catch (e) {}
@@ -997,20 +932,19 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
       status.innerText = "データベースに保存中...";
       try {
         var res = await fetch(API_BASE + '/api/info', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ raw_text: rawText, formatted_text: formattedText, tag: tag, is_active: isActive })
         });
         if (res.ok) {
-          status.style.color = "#4ade80";
-          status.innerText = "追加完了: " + formattedText;
-          document.getElementById('rawText').value = '';
-          showToast("📢 テロップを登録しました！", false);
-          loadTickerList();
+          status.style.color = "#4ade80"; status.innerText = "追加完了: " + formattedText;
+          document.getElementById('rawText').value = ''; showToast("📢 テロップ登録完了", false); loadTickerList();
+        } else {
+          var errData = await res.json();
+          showToast("❌ エラー: " + errData.error, true);
         }
-      } finally {
-        submitBtn.disabled = false;
-      }
+      } catch (err) {
+        showToast("❌ 通信エラー: " + err.message, true);
+      } finally { submitBtn.disabled = false; }
     }
 
     async function loadTickerList() {
@@ -1019,35 +953,18 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
       try {
         var res = await fetch(API_BASE + '/api/info/all');
         var items = await res.json();
-        if (!items || !Array.isArray(items) || items.length === 0) {
-          listEl.innerHTML = '<div style="text-align:center; color:#64748b;">登録されたテロップはありません</div>';
-          return;
-        }
+        if (!items || items.length === 0) { listEl.innerHTML = '<div style="text-align:center; color:#64748b;">登録なし</div>'; return; }
         listEl.innerHTML = '';
         items.forEach(function(item) {
-          var isEmergency = (item.tag || '').indexOf('緊急') !== -1;
           var card = document.createElement('div');
-          card.className = 'item-card ' + (item.is_active ? 'item-active' : 'item-inactive') + (isEmergency ? ' item-emergency' : '');
-
+          card.className = 'item-card ' + (item.is_active ? 'item-active' : 'item-inactive') + ((item.tag||'').indexOf('緊急')!==-1 ? ' item-emergency' : '');
           var tagOptions = '';
-          TAG_LIST.forEach(function(t) {
-            tagOptions += '<option value="' + t + '"' + ((t === item.tag) ? ' selected' : '') + '>' + t + '</option>';
-          });
-
+          TAG_LIST.forEach(function(t) { tagOptions += '<option value="'+t+'"'+(t===item.tag?' selected':'')+'>'+t+'</option>'; });
           card.innerHTML = 
-            '<div class="item-header">' +
-              '<label style="display:flex; align-items:center; gap:8px; cursor:pointer;">' +
-                '<input type="checkbox" id="check-' + item.id + '"' + (item.is_active ? ' checked' : '') + ' onchange="updateTicker(' + item.id + ')">' +
-                '<strong style="color:' + (item.is_active ? '#38bdf8' : '#94a3b8') + '">' + (item.is_active ? '● 表示中' : '✕ 非表示') + '</strong>' +
-              '</label>' +
-              '<select id="tag-' + item.id + '" onchange="updateTicker(' + item.id + ')">' + tagOptions + '</select>' +
-            '</div>' +
+            '<div class="item-header"><label style="display:flex; align-items:center; gap:8px; cursor:pointer;"><input type="checkbox" id="check-'+item.id+'"'+(item.is_active?' checked':'')+' onchange="updateTicker('+item.id+')"><strong style="color:'+(item.is_active?'#38bdf8':'#94a3b8')+'">'+(item.is_active?'● 表示中':'✕ 非表示')+'</strong></label><select id="tag-'+item.id+'" onchange="updateTicker('+item.id+')">'+tagOptions+'</select></div>' +
             '<div style="font-size:12px; color:#94a3b8; margin-bottom:6px;">【入力原文】' + escapeHtml(item.raw_text) + '</div>' +
-            '<input type="text" id="text-' + item.id + '" value="' + escapeHtml(item.formatted_text || item.raw_text) + '">' +
-            '<div style="display:flex; justify-content:space-between; margin-top:10px;">' +
-              '<button class="btn btn-save" onclick="updateTicker(' + item.id + ', this)">変更を保存</button>' +
-              '<button class="btn btn-danger" onclick="deleteTicker(' + item.id + ')">削除</button>' +
-            '</div>';
+            '<input type="text" id="text-'+item.id+'" value="' + escapeHtml(item.formatted_text || item.raw_text) + '">' +
+            '<div style="display:flex; justify-content:space-between; margin-top:10px;"><button class="btn btn-save" onclick="updateTicker('+item.id+', this)">変更を保存</button><button class="btn btn-danger" onclick="deleteTicker('+item.id+')">削除</button></div>';
           listEl.appendChild(card);
         });
       } catch (e) {}
@@ -1055,333 +972,223 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
 
     async function updateTicker(id, btn) {
       if (btn) { btn.disabled = true; btn.innerText = "保存中..."; }
-      var is_active = document.getElementById('check-' + id).checked;
-      var tag = document.getElementById('tag-' + id).value;
-      var formatted_text = document.getElementById('text-' + id).value;
-      await fetch(API_BASE + '/api/info/update', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ id: id, is_active: is_active, tag: tag, formatted_text: formatted_text })
-      });
-      showToast("✅ 変更を保存しました！", false);
-      loadTickerList();
+      try {
+        await fetch(API_BASE + '/api/info/update', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: id, is_active: document.getElementById('check-'+id).checked, tag: document.getElementById('tag-'+id).value, formatted_text: document.getElementById('text-'+id).value })
+        });
+        showToast("✅ 保存しました", false); loadTickerList();
+      } catch (e) {
+        showToast("❌ 通信エラー", true); if (btn) { btn.disabled = false; btn.innerText = "変更を保存"; }
+      }
     }
 
     async function deleteTicker(id) {
       if (!confirm("本当に削除しますか？")) return;
-      await fetch(API_BASE + '/api/info/delete', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ id: id })
-      });
-      showToast("🗑️ 削除しました", false);
-      loadTickerList();
+      await fetch(API_BASE + '/api/info/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: id }) });
+      showToast("🗑️ 削除しました", false); loadTickerList();
     }
 
-    // --- タイムテーブル処理 ---
+    // --- タイムテーブル管理 (1日目・2日目 タブ対応) ---
+    function setEditDay(day) {
+      currentEditDay = day;
+      var btn1 = document.getElementById('btnEditDay1');
+      var btn2 = document.getElementById('btnEditDay2');
+      if (day === 1) {
+        btn1.className = 'btn'; btn1.style.background = '#2563eb';
+        btn2.className = 'btn btn-secondary'; btn2.style.background = '#475569';
+      } else {
+        btn2.className = 'btn'; btn2.style.background = '#2563eb';
+        btn1.className = 'btn btn-secondary'; btn1.style.background = '#475569';
+      }
+      document.getElementById('txtEditDayLabel').innerText = day + "日目";
+      document.getElementById('txtListDayLabel').innerText = day + "日目";
+      document.getElementById('lblDelModalDay').innerText = day + "日目";
+      document.getElementById('lblImpModalDay').innerText = day + "日目";
+      renderTimetableList();
+    }
+
     async function submitTimetable() {
       var startTime = padTime(document.getElementById('ttStart').value);
       var endTime = padTime(document.getElementById('ttEnd').value);
       var title = document.getElementById('ttTitle').value.trim();
       var band = document.getElementById('ttBand').value.trim();
       var type = document.getElementById('ttType').value;
-
       if (!title) return alert("企画名を入力してください");
 
       try {
         var res = await fetch(API_BASE + '/api/timetable', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ start_time: startTime, end_time: endTime, title: title, band: band, type: type })
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ day: currentEditDay, start_time: startTime, end_time: endTime, title: title, band: band, type: type })
         });
         var data = await res.json();
         if (res.ok) {
-          showToast("📅 タイムスケジュールに追加しました！", false);
-          document.getElementById('ttTitle').value = '';
-          document.getElementById('ttBand').value = '';
+          showToast("📅 追加しました！", false);
+          document.getElementById('ttTitle').value = ''; document.getElementById('ttBand').value = '';
           loadTimetableList();
-        } else {
-          showToast("❌ " + (data.error || "追加失敗"), true);
-        }
-      } catch (err) {
-        showToast("❌ 通信エラーが発生しました", true);
-      }
+        } else { showToast("❌ " + (data.error || "追加失敗"), true); }
+      } catch (err) { showToast("❌ 通信エラー: " + err.message, true); }
     }
 
     async function loadTimetableList() {
-      var listEl = document.getElementById('timetableList');
-      if (!listEl) return;
       try {
         var res = await fetch(API_BASE + '/api/timetable');
-        var items = await res.json();
-        if (!items || !Array.isArray(items) || items.length === 0) {
-          listEl.innerHTML = '<div style="text-align:center; color:#64748b;">登録された演目はありません</div>';
+        gAllTimetable = await res.json();
+        if (gAllTimetable.error) {
+          console.error("Timetable load error:", gAllTimetable.error);
           return;
         }
-
-        listEl.innerHTML = '';
-        for (var i = 0; i < items.length; i++) {
-          var item = items[i];
-          var card = document.createElement('div');
-          card.className = 'item-card ' + ((item.type === 'song' || item.type === 'ステージ（演奏・企画）') ? 'item-song' : 'item-break');
-          
-          var safeStartTime = padTime(item.start_time);
-          var safeEndTime = padTime(item.end_time);
-
-          card.innerHTML = 
-            '<div class="item-header">' +
-              '<div style="display:flex; gap:8px; align-items:center;">' +
-                '<input type="time" id="tt-s-' + item.id + '" value="' + safeStartTime + '" style="width:110px;">' +
-                '<span>〜</span>' +
-                '<input type="time" id="tt-e-' + item.id + '" value="' + safeEndTime + '" style="width:110px;">' +
-                '<select id="tt-t-' + item.id + '" style="width:120px;">' +
-                  '<option value="song"' + ((item.type === 'song' || item.type === 'ステージ（演奏・企画）') ? ' selected' : '') + '>ステージ</option>' +
-                  '<option value="break"' + ((item.type === 'break' || item.type === '幕間（準備・CM放映）') ? ' selected' : '') + '>幕間CM</option>' +
-                '</select>' +
-              '</div>' +
-            '</div>' +
-            '<div style="display:flex; gap:8px; margin-top:8px;">' +
-              '<input type="text" id="tt-title-' + item.id + '" value="' + escapeHtml(item.title) + '" placeholder="企画" style="flex:2;">' +
-              '<input type="text" id="tt-band-' + item.id + '" value="' + escapeHtml(item.band || '') + '" placeholder="詳細" style="flex:1;">' +
-            '</div>' +
-            '<div style="display:flex; justify-content:flex-end; gap:8px; margin-top:10px;">' +
-              '<button class="btn btn-save" onclick="updateTimetable(' + item.id + ', this)">変更保存</button>' +
-              '<button class="btn btn-danger" onclick="deleteTimetable(' + item.id + ')">削除</button>' +
-            '</div>';
-          listEl.appendChild(card);
-        }
+        renderTimetableList();
       } catch (e) {
-        listEl.innerHTML = '<div style="color:#f87171;">取得失敗</div>';
+        console.error("Timetable fetch error:", e);
       }
+    }
+
+    function renderTimetableList() {
+      var listEl = document.getElementById('timetableList');
+      if (!listEl) return;
+      var items = gAllTimetable.filter(function(i) { return i.day === currentEditDay; });
+
+      if (items.length === 0) {
+        listEl.innerHTML = '<div style="text-align:center; color:#64748b;">' + currentEditDay + '日目の登録はありません</div>';
+        return;
+      }
+      listEl.innerHTML = '';
+      items.forEach(function(item) {
+        var card = document.createElement('div');
+        card.className = 'item-card ' + ((item.type === 'song' || item.type === 'ステージ（演奏・企画）') ? 'item-song' : 'item-break');
+        card.innerHTML = 
+          '<div class="item-header"><div style="display:flex; gap:8px; align-items:center;">' +
+            '<input type="time" id="tt-s-'+item.id+'" value="'+padTime(item.start_time)+'" style="width:110px;"><span>〜</span>' +
+            '<input type="time" id="tt-e-'+item.id+'" value="'+padTime(item.end_time)+'" style="width:110px;">' +
+            '<select id="tt-t-'+item.id+'" style="width:120px;">' +
+              '<option value="song"'+((item.type==='song'||item.type==='ステージ（演奏・企画）')?' selected':'')+'>ステージ</option>' +
+              '<option value="break"'+((item.type==='break'||item.type==='幕間（準備・CM放映）')?' selected':'')+'>幕間CM</option>' +
+            '</select></div></div>' +
+          '<div style="display:flex; gap:8px; margin-top:8px;">' +
+            '<input type="text" id="tt-title-'+item.id+'" value="'+escapeHtml(item.title)+'" placeholder="企画" style="flex:2;">' +
+            '<input type="text" id="tt-band-'+item.id+'" value="'+escapeHtml(item.band||'')+'" placeholder="詳細" style="flex:1;">' +
+          '</div>' +
+          '<div style="display:flex; justify-content:flex-end; gap:8px; margin-top:10px;">' +
+            '<button class="btn btn-save" onclick="updateTimetable('+item.id+', this)">変更保存</button>' +
+            '<button class="btn btn-danger" onclick="deleteTimetable('+item.id+')">削除</button>' +
+          '</div>';
+        listEl.appendChild(card);
+      });
     }
 
     async function updateTimetable(id, btn) {
       if (btn) { btn.disabled = true; btn.innerText = "保存中..."; }
-      var start_time = padTime(document.getElementById('tt-s-' + id).value);
-      var end_time = padTime(document.getElementById('tt-e-' + id).value);
-      var type = document.getElementById('tt-t-' + id).value;
-      var title = document.getElementById('tt-title-' + id).value;
-      var band = document.getElementById('tt-band-' + id).value;
-
       try {
         var res = await fetch(API_BASE + '/api/timetable/update', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ id: id, start_time: start_time, end_time: end_time, type: type, title: title, band: band })
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: id, day: currentEditDay, start_time: document.getElementById('tt-s-'+id).value, end_time: document.getElementById('tt-e-'+id).value, type: document.getElementById('tt-t-'+id).value, title: document.getElementById('tt-title-'+id).value, band: document.getElementById('tt-band-'+id).value })
         });
         var data = await res.json();
-        if (res.ok) {
-          showToast("✅ タイムテーブルを更新しました！", false);
-          loadTimetableList();
-        } else {
-          showToast("❌ " + (data.error || "更新失敗"), true);
-          if (btn) { btn.disabled = false; btn.innerText = "変更保存"; }
-        }
-      } catch (e) {
-        showToast("❌ 通信エラーが発生しました", true);
-        if (btn) { btn.disabled = false; btn.innerText = "変更保存"; }
-      }
+        if (res.ok) { showToast("✅ 更新しました", false); loadTimetableList(); }
+        else { showToast("❌ " + data.error, true); if(btn){btn.disabled=false;btn.innerText="変更保存";} }
+      } catch (e) { showToast("❌ 通信エラー: " + e.message, true); if(btn){btn.disabled=false;btn.innerText="変更保存";} }
     }
 
     async function deleteTimetable(id) {
-      if (!confirm("この演目を削除しますか？")) return;
-      await fetch(API_BASE + '/api/timetable/delete', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ id: id })
-      });
-      showToast("🗑️ 削除しました", false);
-      loadTimetableList();
+      if (!confirm("削除しますか？")) return;
+      await fetch(API_BASE + '/api/timetable/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: id }) });
+      showToast("🗑️ 削除しました", false); loadTimetableList();
     }
 
-    function openDeleteRangeModal() {
-      document.getElementById('deleteRangeModal').classList.add('active');
-    }
-
-    function closeDeleteRangeModal() {
-      document.getElementById('deleteRangeModal').classList.remove('active');
-    }
+    function openDeleteRangeModal() { document.getElementById('deleteRangeModal').classList.add('active'); }
+    function closeDeleteRangeModal() { document.getElementById('deleteRangeModal').classList.remove('active'); }
 
     async function executeDeleteRange() {
       var start = padTime(document.getElementById('delStartTime').value);
       var end = padTime(document.getElementById('delEndTime').value);
-      
-      if (!start || !end) return alert("時刻を指定してください");
-      if (start >= end) return alert("終了時刻を開始時刻より後にしてください");
-
-      if (!confirm("【確認】" + start + " 〜 " + end + " の範囲に完全に収まる演目をすべて削除します。\\nよろしいですか？")) return;
+      if (!start || !end || start >= end) return alert("正しい時刻を指定してください");
+      if (!confirm("【" + currentEditDay + "日目】 " + start + " 〜 " + end + " をすべて削除しますか？")) return;
 
       try {
         var res = await fetch(API_BASE + '/api/timetable/delete_range', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ start_time: start, end_time: end })
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ day: currentEditDay, start_time: start, end_time: end })
         });
         var data = await res.json();
-        if (res.ok) {
-          showToast("🗑️ 範囲内の演目をすべて削除しました！", false);
-          closeDeleteRangeModal();
-          loadTimetableList();
-        } else {
-          showToast("❌ " + (data.error || "削除失敗"), true);
-        }
-      } catch (e) {
-        showToast("❌ 通信エラーが発生しました", true);
-      }
+        if (res.ok) { showToast("🗑️ 削除しました", false); closeDeleteRangeModal(); loadTimetableList(); }
+        else { showToast("❌ 削除失敗: " + data.error, true); }
+      } catch (e) { showToast("❌ 通信エラー: " + e.message, true); }
     }
 
-    function openImportModal() {
-      document.getElementById('importModal').classList.add('active');
-      document.getElementById('importRawText').focus();
-    }
-
-    function closeImportModal() {
-      document.getElementById('importModal').classList.remove('active');
-    }
+    function openImportModal() { document.getElementById('importModal').classList.add('active'); document.getElementById('importRawText').focus(); }
+    function closeImportModal() { document.getElementById('importModal').classList.remove('active'); }
 
     function parseImportText() {
       var text = document.getElementById('importRawText').value;
       var tbody = document.getElementById('importPreviewBody');
-      var statsEl = document.getElementById('importStats');
       var btnExecute = document.getElementById('btnExecuteImport');
-
       parsedBatchItems = [];
 
-      if (!text || !text.trim()) {
-        tbody.innerHTML = '<tr><td colspan="6" style="text-align:center; color:#64748b; padding:16px;">ここにリアルタイムプレビューが表示されます</td></tr>';
-        statsEl.innerText = '解析結果: 0 件';
-        btnExecute.disabled = true;
-        btnExecute.innerText = 'インポートする';
-        return;
-      }
+      if (!text.trim()) { tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;">プレビューが表示されます</td></tr>'; btnExecute.disabled = true; return; }
 
       var rawLines = text.split('\\n');
       var parsed = [];
-
       for (var i = 0; i < rawLines.length; i++) {
         var line = rawLines[i].trim();
         if (!line) continue;
-
         var cols = (line.indexOf('\\t') !== -1) ? line.split('\\t') : line.split(',');
-        var startTime = padTime((cols[0] || '').trim());
-        var endTime = padTime((cols[1] || '').trim());
-        var title = (cols[2] || '').trim();
-        var band = (cols[3] || '').trim();
-        var typeRaw = (cols[4] || '').trim();
-        var type = (typeRaw.indexOf('幕間') !== -1 || typeRaw.indexOf('break') !== -1 || typeRaw.indexOf('CM') !== -1) ? 'break' : 'song';
-
-        var error = '';
-        var timeRegex = /^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$/;
-
-        if (!startTime || !timeRegex.test(startTime)) {
-          error = '開始時刻が不正 (HH:MM)';
-        } else if (!endTime || !timeRegex.test(endTime)) {
-          error = '終了時刻が不正 (HH:MM)';
-        } else if (startTime >= endTime) {
-          error = '終了が開始より前';
-        } else if (!title) {
-          error = '企画名が空欄';
-        }
-
+        var startTime = padTime((cols[0] || '').trim()), endTime = padTime((cols[1] || '').trim());
+        var title = (cols[2] || '').trim(), band = (cols[3] || '').trim();
+        var type = ((cols[4] || '').indexOf('幕間') !== -1 || (cols[4] || '').indexOf('CM') !== -1) ? 'break' : 'song';
+        var error = (!startTime || !endTime) ? '時刻不正' : (startTime >= endTime ? '時間逆転' : (!title ? '企画名空欄' : ''));
         parsed.push({ idx: parsed.length + 1, start_time: startTime, end_time: endTime, title: title, band: band, type: type, error: error });
       }
 
       for (var aIdx = 0; aIdx < parsed.length; aIdx++) {
         for (var bIdx = aIdx + 1; bIdx < parsed.length; bIdx++) {
-          var a = parsed[aIdx];
-          var b = parsed[bIdx];
-          if (!a.error && !b.error) {
-            if (a.start_time < b.end_time && a.end_time > b.start_time) {
-              a.error = '行' + b.idx + 'と時間重複';
-              b.error = '行' + a.idx + 'と時間重複';
-            }
+          if (!parsed[aIdx].error && !parsed[bIdx].error && parsed[aIdx].start_time < parsed[bIdx].end_time && parsed[aIdx].end_time > parsed[bIdx].start_time) {
+            parsed[aIdx].error = '行' + parsed[bIdx].idx + 'と重複'; parsed[bIdx].error = '行' + parsed[aIdx].idx + 'と重複';
           }
         }
       }
 
-      var errorCount = 0;
-      var rowsHtml = '';
-      for (var k = 0; k < parsed.length; k++) {
-        var p = parsed[k];
+      var errorCount = 0, rowsHtml = '';
+      parsed.forEach(function(p) {
         if (p.error) errorCount++;
-        rowsHtml += '<tr class="' + (p.error ? 'has-error' : '') + '">' +
-          '<td>' + escapeHtml(p.start_time || '-') + '</td>' +
-          '<td>' + escapeHtml(p.end_time || '-') + '</td>' +
-          '<td><strong>' + escapeHtml(p.title || '-') + '</strong></td>' +
-          '<td>' + escapeHtml(p.band || '-') + '</td>' +
-          '<td>' + (p.type === 'song' ? 'ステージ' : '幕間') + '</td>' +
-          '<td>' + (p.error ? '<span style="color:#f87171; font-weight:bold;">❌ ' + p.error + '</span>' : '<span style="color:#4ade80;">✅ OK</span>') + '</td>' +
-        '</tr>';
-      }
+        rowsHtml += '<tr class="'+(p.error?'has-error':'')+'"><td>'+p.start_time+'</td><td>'+p.end_time+'</td><td>'+escapeHtml(p.title)+'</td><td>'+escapeHtml(p.band)+'</td><td>'+(p.type==='song'?'ステージ':'幕間')+'</td><td>'+(p.error?'❌ '+p.error:'✅ OK')+'</td></tr>';
+      });
       tbody.innerHTML = rowsHtml;
+      document.getElementById('importStats').innerText = "解析結果: " + parsed.length + " 件" + (errorCount > 0 ? " (エラー: " + errorCount + ")" : "");
 
-      statsEl.innerHTML = '解析結果: <strong>' + parsed.length + '</strong> 件 ' + (errorCount > 0 ? '<span style="color:#f87171; margin-left:8px;">(エラー: ' + errorCount + '件)</span>' : '<span style="color:#4ade80; margin-left:8px;">(全件正常)</span>');
-
-      if (errorCount > 0 || parsed.length === 0) {
-        btnExecute.disabled = true;
-        btnExecute.innerText = 'エラーを修正してください';
-      } else {
-        btnExecute.disabled = false;
-        btnExecute.innerText = parsed.length + ' 件を一括インポート';
-        parsedBatchItems = [];
-        for (var m = 0; m < parsed.length; m++) {
-          parsedBatchItems.push({
-            start_time: parsed[m].start_time,
-            end_time: parsed[m].end_time,
-            title: parsed[m].title,
-            band: parsed[m].band,
-            type: parsed[m].type
-          });
-        }
+      if (errorCount > 0 || parsed.length === 0) { btnExecute.disabled = true; btnExecute.innerText = 'エラーを修正してください'; }
+      else {
+        btnExecute.disabled = false; btnExecute.innerText = currentEditDay + ' 日目に一括インポート';
+        parsedBatchItems = parsed;
       }
     }
 
     async function executeBatchImport() {
       if (parsedBatchItems.length === 0) return;
       var overwrite = document.getElementById('importOverwrite').checked;
+      if (overwrite && !confirm("【確認】" + currentEditDay + "日目の既存データをすべて削除しますか？")) return;
 
-      if (overwrite && !confirm("【確認】既存のタイムテーブルをすべて削除して置き換えますか？")) {
-        return;
-      }
-
-      var btnExecute = document.getElementById('btnExecuteImport');
-      btnExecute.disabled = true;
-      btnExecute.innerText = 'インポート処理中...';
-
+      document.getElementById('btnExecuteImport').disabled = true;
       try {
         var res = await fetch(API_BASE + '/api/timetable/batch', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ items: parsedBatchItems, overwrite: overwrite })
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ items: parsedBatchItems, overwrite: overwrite, day: currentEditDay })
         });
         var data = await res.json();
-
-        if (res.ok) {
-          showToast('🎉 ' + data.count + ' 件を一括登録しました！', false);
-          closeImportModal();
-          document.getElementById('importRawText').value = '';
-          parseImportText();
-          loadTimetableList();
-        } else {
-          showToast('❌ ' + (data.error || 'インポート失敗'), true);
-          btnExecute.disabled = false;
-          btnExecute.innerText = parsedBatchItems.length + ' 件を一括インポート';
-        }
-      } catch (err) {
-        showToast('❌ 通信エラーが発生しました', true);
-        btnExecute.disabled = false;
-      }
+        if (res.ok) { showToast('🎉 一括登録完了！', false); closeImportModal(); loadTimetableList(); }
+        else { showToast('❌ インポート失敗: ' + data.error, true); document.getElementById('btnExecuteImport').disabled = false; }
+      } catch (err) { showToast('❌ 通信エラー: ' + err.message, true); document.getElementById('btnExecuteImport').disabled = false; }
     }
 
+    // --- 右側パネル管理 ---
     function handleImageSelect(event) {
       var file = event.target.files[0];
       if (!file) return;
       var reader = new FileReader();
       reader.onload = function(e) {
         selectedImageData = e.target.result;
-        var img = document.getElementById('sidePreviewImg');
-        img.src = selectedImageData;
-        img.style.display = 'block';
+        document.getElementById('sidePreviewImg').src = selectedImageData;
+        document.getElementById('sidePreviewImg').style.display = 'block';
         document.getElementById('uploadPrompt').style.display = 'none';
       };
       reader.readAsDataURL(file);
@@ -1389,39 +1196,23 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
 
     async function submitSidebar() {
       var title = document.getElementById('sideTitleInput').value.trim();
-      var desc = document.getElementById('sideDescInput').value.trim();
-      var duration = document.getElementById('sideDurationInput').value;
-      var isActive = document.getElementById('sideActiveCheck').checked;
-
       if (!title) return alert("タイトルを入力してください");
-
       try {
         var res = await fetch(API_BASE + '/api/sidebar', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            title: title,
-            description: desc,
-            image_data: selectedImageData,
-            duration: Number(duration),
-            is_active: isActive ? 1 : 0
-          })
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ title: title, description: document.getElementById('sideDescInput').value.trim(), image_data: selectedImageData, duration: Number(document.getElementById('sideDurationInput').value), is_active: document.getElementById('sideActiveCheck').checked ? 1 : 0 })
         });
+        var data = await res.json();
         if (res.ok) {
-          showToast("🖼️ パネルスライドを追加しました！", false);
-          document.getElementById('sideTitleInput').value = '';
-          document.getElementById('sideDescInput').value = '';
-          selectedImageData = '';
-          document.getElementById('sidePreviewImg').style.display = 'none';
-          document.getElementById('uploadPrompt').style.display = 'block';
-          document.getElementById('sideFileInput').value = '';
+          showToast("🖼️ パネル追加完了！", false);
+          document.getElementById('sideTitleInput').value = ''; document.getElementById('sideDescInput').value = '';
+          selectedImageData = ''; document.getElementById('sidePreviewImg').style.display = 'none'; document.getElementById('uploadPrompt').style.display = 'block';
           loadSidebarList();
         } else {
-          var err = await res.json();
-          showToast("❌ 追加失敗: " + (err.error || "エラー"), true);
+          showToast("❌ エラー: " + data.error, true);
         }
       } catch (e) {
-        showToast("❌ 通信エラーが発生しました", true);
+        showToast("❌ 通信エラー: " + e.message, true);
       }
     }
 
@@ -1431,108 +1222,43 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
       try {
         var res = await fetch(API_BASE + '/api/sidebar/all');
         var items = await res.json();
-        if (!items || !Array.isArray(items) || items.length === 0) {
-          listEl.innerHTML = '<div style="text-align:center; color:#64748b;">登録されたパネルはありません</div>';
-          return;
-        }
+        if (!items || items.length === 0) { listEl.innerHTML = '<div style="text-align:center; color:#64748b;">登録なし</div>'; return; }
         listEl.innerHTML = '';
         items.forEach(function(item) {
           var card = document.createElement('div');
           card.className = 'item-card ' + (item.is_active ? 'item-active' : 'item-inactive');
           card.innerHTML = 
-            '<div class="item-header" style="margin-bottom:12px;">' +
-              '<label style="display:flex; align-items:center; gap:8px; cursor:pointer;">' +
-                '<input type="checkbox" id="side-check-' + item.id + '"' + (item.is_active ? ' checked' : '') + ' onchange="updateSidebar(' + item.id + ')">' +
-                '<strong style="color:' + (item.is_active ? '#38bdf8' : '#94a3b8') + '">' + (item.is_active ? '● 表示中' : '✕ 非表示') + '</strong>' +
-              '</label>' +
-              '<div style="display:flex; align-items:center; gap:4px;">' +
-                '<span style="font-size:12px; color:#94a3b8;">表示秒数:</span>' +
-                '<input type="number" id="side-dur-' + item.id + '" value="' + (item.duration || 10) + '" style="width:60px; padding:4px 8px;">' +
-              '</div>' +
-            '</div>' +
-            (item.image_data ? '<img src="' + item.image_data + '" class="thumb-preview">' : '') +
-            '<div style="display:flex; flex-direction:column; gap:8px; margin-bottom:12px;">' +
-              '<input type="text" id="side-title-' + item.id + '" value="' + escapeHtml(item.title) + '" placeholder="タイトル">' +
-              '<textarea id="side-desc-' + item.id + '" placeholder="説明・本文">' + escapeHtml(item.description || '') + '</textarea>' +
-            '</div>' +
-            '<div style="display:flex; justify-content:flex-end; gap:8px;">' +
-              '<button class="btn btn-save" onclick="updateSidebar(' + item.id + ', this)">変更保存</button>' +
-              '<button class="btn btn-danger" onclick="deleteSidebar(' + item.id + ')">削除</button>' +
-            '</div>';
+            '<div class="item-header" style="margin-bottom:12px;"><label style="display:flex; align-items:center; gap:8px;"><input type="checkbox" id="side-check-'+item.id+'"'+(item.is_active?' checked':'')+' onchange="updateSidebar('+item.id+')"><strong style="color:'+(item.is_active?'#38bdf8':'#94a3b8')+'">'+(item.is_active?'● 表示中':'✕ 非表示')+'</strong></label><div>表示秒数: <input type="number" id="side-dur-'+item.id+'" value="'+(item.duration||10)+'" style="width:60px;"></div></div>' +
+            (item.image_data ? '<img src="'+item.image_data+'" class="thumb-preview">' : '') +
+            '<div style="display:flex; flex-direction:column; gap:8px; margin-bottom:12px;"><input type="text" id="side-title-'+item.id+'" value="'+escapeHtml(item.title)+'"><textarea id="side-desc-'+item.id+'">'+escapeHtml(item.description||'')+'</textarea></div>' +
+            '<div style="display:flex; justify-content:flex-end; gap:8px;"><button class="btn btn-save" onclick="updateSidebar('+item.id+', this)">変更保存</button><button class="btn btn-danger" onclick="deleteSidebar('+item.id+')">削除</button></div>';
           listEl.appendChild(card);
         });
-      } catch (e) {
-        listEl.innerHTML = '<div style="color:#f87171;">取得失敗</div>';
-      }
+      } catch (e) {}
     }
 
     async function updateSidebar(id, btn) {
       if (btn) { btn.disabled = true; btn.innerText = "保存中..."; }
-      
-      var is_active = document.getElementById('side-check-' + id).checked;
-      var title = document.getElementById('side-title-' + id).value;
-      var description = document.getElementById('side-desc-' + id).value;
-      var duration = document.getElementById('side-dur-' + id).value;
-
       try {
         await fetch(API_BASE + '/api/sidebar/update', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ 
-            id: id, 
-            title: title, 
-            description: description, 
-            duration: Number(duration), 
-            is_active: is_active 
-          })
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: id, title: document.getElementById('side-title-'+id).value, description: document.getElementById('side-desc-'+id).value, duration: document.getElementById('side-dur-'+id).value, is_active: document.getElementById('side-check-'+id).checked })
         });
-        showToast("✅ パネルの変更を保存しました！", false);
-        if (!btn) {
-          loadSidebarList(); 
-        } else {
-          btn.disabled = false;
-          btn.innerText = "変更保存";
-          var card = btn.closest('.item-card');
-          if (is_active) {
-            card.classList.add('item-active');
-            card.classList.remove('item-inactive');
-            card.querySelector('strong').style.color = '#38bdf8';
-            card.querySelector('strong').innerText = '● 表示中';
-          } else {
-            card.classList.add('item-inactive');
-            card.classList.remove('item-active');
-            card.querySelector('strong').style.color = '#94a3b8';
-            card.querySelector('strong').innerText = '✕ 非表示';
-          }
-        }
+        showToast("✅ 保存しました", false); loadSidebarList();
       } catch (e) {
-        showToast("❌ 変更に失敗しました", true);
-        if (btn) { btn.disabled = false; btn.innerText = "変更保存"; }
+        showToast("❌ 通信エラー", true); if (btn) { btn.disabled = false; btn.innerText = "変更保存"; }
       }
     }
 
     async function deleteSidebar(id) {
-      if (!confirm("本当にこのパネルを削除しますか？")) return;
-      try {
-        await fetch(API_BASE + '/api/sidebar/delete', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ id: id })
-        });
-        showToast("🗑️ パネルを削除しました", false);
-        loadSidebarList();
-      } catch (e) {
-        showToast("❌ 削除に失敗しました", true);
-      }
+      if (!confirm("削除しますか？")) return;
+      await fetch(API_BASE + '/api/sidebar/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: id }) });
+      showToast("🗑️ 削除しました", false); loadSidebarList();
     }
 
-    function escapeHtml(str) {
-      return (str || '').replace(/[&<>'"]/g, function(tag) {
-        return { '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[tag] || tag;
-      });
-    }
+    function escapeHtml(str) { return (str || '').replace(/[&<>'"]/g, function(t) { return {'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[t] || t; }); }
 
-    // 初期起動タブ
+    setEditDay(1);
     switchTab('control');
   </script>
 </body>
