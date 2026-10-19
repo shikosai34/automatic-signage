@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Kiwi+Maru:wght@400;500&display=swap" rel="stylesheet">
+
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    
+    /* スクロールバーを完全に消去 */
+    ::-webkit-scrollbar {
+      display: none !important;
+      width: 0 !important;
+      height: 0 !important;
+    }
+
+    html, body {
+      background-color: transparent !important;
+      overflow: hidden !important; /* スクロールバーの出現を完全に防止 */
+      width: 100%;
+      height: 100%;
+      display: flex;
+      justify-content: flex-start;
+      align-items: center;
+      font-family: 'Kiwi Maru', serif;
+    }
+
+    .program-box {
+      display: flex;
+      align-items: center;
+      width: 100%; /* 横幅いっぱいに広げる */
+      transition: opacity 0.3s ease;
+      white-space: nowrap;
+    }
+
+    /* オレンジの帯：右端のアクセント線の飛び出し分(約50px)を除いて画面幅いっぱいまで伸ばす */
+    .program-content-wrapper {
+      position: relative;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      align-items: center; /* 文字は中央揃え */
+      text-align: center;
+      width: calc(100% - 50px); /* 画面右端ギリギリまで伸ばす */
+      padding: 12px 60px 14px 40px;
+      z-index: 1;
+      filter: drop-shadow(2px 4px 6px rgba(0, 0, 0, 0.5));
+      white-space: nowrap;
+    }
+
+    /* オレンジ色のメイン背景（右側斜めカット） */
+    .program-content-wrapper::before {
+      content: "";
+      position: absolute;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background-color: #FF9933;
+      clip-path: polygon(0 0, calc(100% - 30px) 0, 100% 100%, 0 100%);
+      z-index: -1;
+    }
+
+    /* 右側のアクセント斜め線 */
+    .program-content-wrapper::after {
+      content: "";
+      position: absolute;
+      top: 0; 
+      right: -36px;
+      width: 40px;
+      height: 100%;
+      background-color: #FF9933;
+      clip-path: polygon(0 0, 12px 0, 42px 100%, 30px 100%);
+      z-index: -1;
+    }
+
+    /* 1行目：バッジ ＋ 団体名 */
+    .top-row {
+      display: flex;
+      align-items: baseline;
+      justify-content: center;
+      gap: 14px;
+      white-space: nowrap;
+    }
+
+    /* ステージバッジ */
+    .badge-inline {
+      font-size: 18px;
+      font-weight: 500;
+      color: #00FFCC;
+      letter-spacing: 1.5px;
+      text-transform: uppercase;
+      text-shadow: 1px 1px 2px rgba(0, 0, 0, 0.6);
+      white-space: nowrap;
+    }
+
+    /* 団体名 */
+    .program-main-text {
+      font-size: 40px;
+      font-weight: 500;
+      color: #FFFFFF;
+      line-height: 1.15;
+      letter-spacing: 1.5px;
+      text-shadow: 1px 1px 3px rgba(0, 0, 0, 0.3);
+      white-space: nowrap;
+    }
+
+    /* 2行目：詳細 */
+    .program-sub-text {
+      font-size: 22px;
+      font-weight: 400;
+      color: #FFF5EE;
+      line-height: 1.3;
+      letter-spacing: 1px;
+      text-shadow: 1px 1px 2px rgba(0, 0, 0, 0.25);
+      white-space: nowrap;
+      margin-top: 3px;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="program-box" id="programBox" style="display: none;">
+    <div class="program-content-wrapper">
+      <div class="top-row">
+        <div class="badge-inline" id="progTag">ステージ</div>
+        <div class="program-main-text" id="progMain"></div>
+      </div>
+      <div class="program-sub-text" id="progSub"></div>
+    </div>
+  </div>
+
+  <script>
+    const API_URL = 'https://shikosai-signage-api.shikosai.workers.dev/api/state';
+
+    function padTime(t) {
+      if (!t) return '';
+      const p = t.split(':');
+      return p.length === 2 ? ('0' + p[0]).slice(-2) + ':' + ('0' + p[1]).slice(-2) : t;
+    }
+
+    function getCurrentTimeStr() {
+      const now = new Date();
+      return String(now.getHours()).padStart(2, '0') + ':' + String(now.getMinutes()).padStart(2, '0');
+    }
+
+    async function fetchProgramState() {
+      try {
+        const res = await fetch(API_URL + '?t=' + Date.now());
+        const data = await res.json();
+        const state = data.state || {};
+        const timetable = data.timetable || [];
+        const isAuto = state.is_auto !== 0;
+        const nowTime = getCurrentTimeStr();
+
+        let currentIndex = state.current_index;
+
+        if (isAuto) {
+          currentIndex = -1;
+          for (let i = 0; i < timetable.length; i++) {
+            const start = padTime(timetable[i].start_time);
+            const end = padTime(timetable[i].end_time);
+            if (nowTime >= start && nowTime < end) {
+              currentIndex = i;
+              break;
+            }
+          }
+        }
+
+        const boxEl = document.getElementById('programBox');
+        const tagEl = document.getElementById('progTag');
+        const mainEl = document.getElementById('progMain');
+        const subEl = document.getElementById('progSub');
+
+        if (currentIndex >= 0 && timetable[currentIndex]) {
+          const item = timetable[currentIndex];
+          const isSong = (item.type === 'song' || item.type === 'ステージ（演奏・企画）');
+
+          if (!isSong) {
+            boxEl.style.display = 'none';
+            return;
+          }
+
+          tagEl.innerText = item.badge || 'ステージ';
+          
+          const bandText = (item.band || '').trim();
+          const titleText = (item.title || '').trim();
+
+          if (bandText && titleText) {
+            mainEl.innerText = bandText;
+            subEl.innerText = titleText;
+            subEl.style.display = 'block';
+          } else {
+            mainEl.innerText = bandText || titleText || '無題';
+            subEl.style.display = 'none';
+          }
+
+          boxEl.style.display = 'flex';
+        } else {
+          boxEl.style.display = 'none';
+        }
+      } catch (e) {
+        console.warn("演目取得エラー:", e);
+      }
+    }
+
+    setInterval(fetchProgramState, 3000);
+    fetchProgramState();
+  </script>
+</body>
+</html>
