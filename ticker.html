@@ -25,6 +25,7 @@
       position: relative;
     }
 
+    /* 通常テロップ：シアンのネオン */
     .ticker-text {
       position: absolute;
       left: 0;
@@ -35,10 +36,15 @@
       font-size: 60px;
       font-weight: 500;
       color: #E8E8E8;
-      /* ★ シアンのネオン発光エフェクトを追加 */
       text-shadow: 0 0 10px #00FFCC, 0 0 20px #00FFCC, 2px 2px 4px rgba(0, 0, 0, 0.9);
-      visibility: hidden;
       will-change: transform;
+    }
+
+    /* ★ 緊急テロップ用：赤色ネオン発光 ＋ 強調 */
+    .ticker-text.is-emergency {
+      color: #FFF0F0 !important;
+      font-weight: 700 !important;
+      text-shadow: 0 0 12px #FF0033, 0 0 24px #FF0033, 0 0 36px #FF0033, 2px 2px 4px rgba(0, 0, 0, 0.9) !important;
     }
   </style>
 </head>
@@ -47,42 +53,111 @@
   <div class="ticker-wrap" id="wrap"></div>
 
   <script>
-    const SCROLL_SPEED = 150;
-    const GAP_BETWEEN = 160;
+    const SCROLL_SPEED = 150; // 通常のスクロール速度
+    const EMERGENCY_SPEED = 180; // 緊急時の速度（少し速め）
+    const GAP_BETWEEN = 200;  // テロップ間の隙間 (px)
 
     const wrap = document.getElementById('wrap');
-    let lastTime = 0;
-    const queue = [];
-    const activeItems = [];
 
-    function checkTicker() {
+    let normalList = [];     // 通常テロップのリスト
+    let emergencyList = [];  // 緊急テロップのリスト
+    let currentIndex = 0;     // 次に流すインデックス
+    const activeItems = [];   // 現在画面上を動いているテロップ要素
+    let isEmergencyMode = false; // 現在緊急モードかどうか
+
+    // API または ticker_data.js からデータを取得する処理
+    // ※ API URLから直接取得（失敗時は ticker_data.js フォールバック）
+    const API_URL = 'https://shikosai-signage-api.shikosai.workers.dev/api/info';
+
+    async function fetchTickerData() {
+      try {
+        const res = await fetch(API_URL + '?t=' + Date.now());
+        if (res.ok) {
+          const items = await res.json();
+          processItems(items);
+          return;
+        }
+      } catch (e) {
+        // API直接取得が使えない場合は従来の ticker_data.js をチェック
+        loadScriptFallback();
+      }
+    }
+
+    function loadScriptFallback() {
       const script = document.createElement('script');
       script.src = 'ticker_data.js?t=' + Date.now();
       script.onload = () => {
         script.remove();
-        if (typeof latestTickerTime !== 'undefined' && latestTickerTime !== lastTime) {
-          lastTime = latestTickerTime;
-          queue.push(latestTickerText);
+        if (typeof allTickerItems !== 'undefined') {
+          processItems(allTickerItems);
+        } else if (typeof latestTickerText !== 'undefined' && latestTickerText) {
+          processItems([{ formatted_text: latestTickerText, tag: (typeof latestTickerTag !== 'undefined' ? latestTickerTag : 'その他') }]);
         }
       };
       script.onerror = () => { script.remove(); };
       document.body.appendChild(script);
     }
 
-    function spawnTicker(text) {
+    // 取得したアイテムの振り分け・緊急判定
+    function processItems(items) {
+      if (!Array.isArray(items)) return;
+
+      const newNormals = [];
+      const newEmergencies = [];
+
+      items.forEach(item => {
+        const text = (item.formatted_text || item.text || item.raw_text || '').trim();
+        const tag = (item.tag || '').trim();
+        if (!text) return;
+
+        // タグまたは本文に「緊急」が含まれるか判定
+        const isEmg = tag.includes('緊急') || text.startsWith('【緊急】') || text.startsWith('[緊急]');
+        if (isEmg) {
+          newEmergencies.push({ text: text, isEmergency: true });
+        } else {
+          newNormals.push({ text: text, isEmergency: false });
+        }
+      });
+
+      // 緊急テロップの有無を確認
+      const hasEmergencyNow = newEmergencies.length > 0;
+
+      // ★ 緊急モードへ突入：通常テロップを即座に全消去
+      if (hasEmergencyNow && !isEmergencyMode) {
+        isEmergencyMode = true;
+        clearAllActiveElements();
+        currentIndex = 0;
+      }
+      // ★ 緊急モード解除：通常モードに戻る
+      else if (!hasEmergencyNow && isEmergencyMode) {
+        isEmergencyMode = false;
+        clearAllActiveElements();
+        currentIndex = 0;
+      }
+
+      normalList = newNormals;
+      emergencyList = newEmergencies;
+    }
+
+    // 画面上のテロップ要素を即座に全削除する
+    function clearAllActiveElements() {
+      for (let i = activeItems.length - 1; i >= 0; i--) {
+        activeItems[i].el.remove();
+      }
+      activeItems.length = 0;
+    }
+
+    // 新しいテロップ要素を作成して配置
+    function createTickerElement(itemData, startX) {
       const el = document.createElement('div');
-      el.className = 'ticker-text';
-      el.innerText = text;
+      el.className = 'ticker-text' + (itemData.isEmergency ? ' is-emergency' : '');
+      el.innerText = itemData.text;
       wrap.appendChild(el);
 
-      const wrapWidth = wrap.clientWidth || window.innerWidth;
       const textWidth = el.scrollWidth;
+      el.style.transform = `translate3d(${startX}px, -50%, 0)`;
 
-      let currentX = wrapWidth;
-      el.style.transform = `translate3d(${currentX}px, -50%, 0)`;
-      el.style.visibility = 'visible';
-
-      activeItems.push({ el: el, x: currentX, width: textWidth });
+      activeItems.push({ el: el, x: startX, width: textWidth, isEmergency: itemData.isEmergency });
     }
 
     let lastTimestamp = null;
@@ -91,43 +166,55 @@
       const deltaTime = (timestamp - lastTimestamp) / 1000;
       lastTimestamp = timestamp;
 
-      const moveDistance = SCROLL_SPEED * deltaTime;
+      // 緊急時は少し速く流す
+      const currentSpeed = isEmergencyMode ? EMERGENCY_SPEED : SCROLL_SPEED;
+      const moveDistance = currentSpeed * deltaTime;
+      const wrapWidth = wrap.clientWidth || window.innerWidth;
 
+      // 1. 既存の要素を左に移動
       for (let i = activeItems.length - 1; i >= 0; i--) {
         const item = activeItems[i];
         item.x -= moveDistance;
         item.el.style.transform = `translate3d(${item.x}px, -50%, 0)`;
 
-        if (item.x + item.width < -100) {
+        // 画面左端から完全に消えたらDOMから削除
+        if (item.x + item.width < -50) {
           item.el.remove();
           activeItems.splice(i, 1);
         }
       }
 
-      if (queue.length > 0) {
-        const wrapWidth = wrap.clientWidth || window.innerWidth;
-        let canSpawn = false;
+      // 2. 現在のモードに応じた再生リストを選択
+      const currentList = isEmergencyMode ? emergencyList : normalList;
 
+      // 3. 次のテロップを等間隔で補充
+      if (currentList.length > 0) {
         if (activeItems.length === 0) {
-          canSpawn = true;
+          // 画面に何もないときは右端からスタート
+          const nextItem = currentList[currentIndex % currentList.length];
+          currentIndex++;
+          createTickerElement(nextItem, wrapWidth);
         } else {
+          // 最後尾のお尻をチェック
           const lastItem = activeItems[activeItems.length - 1];
-          const lastItemRightEdge = lastItem.x + lastItem.width;
-          if (lastItemRightEdge <= wrapWidth - GAP_BETWEEN) {
-            canSpawn = true;
-          }
-        }
+          const lastRightEdge = lastItem.x + lastItem.width;
 
-        if (canSpawn) {
-          const nextText = queue.shift();
-          spawnTicker(nextText);
+          // 前の文字のお尻が右端に入った瞬間、きっちり GAP_BETWEEN (160px) を空けて次を生成
+          if (lastRightEdge <= wrapWidth) {
+            const nextItem = currentList[currentIndex % currentList.length];
+            currentIndex++;
+            createTickerElement(nextItem, lastRightEdge + GAP_BETWEEN);
+          }
         }
       }
 
       requestAnimationFrame(animateLoop);
     }
 
-    setInterval(checkTicker, 400);
+    // 1.5秒ごとに最新テロップ（緊急テロップの有無）をチェック
+    setInterval(fetchTickerData, 1500);
+    fetchTickerData();
+
     requestAnimationFrame(animateLoop);
   </script>
 </body>

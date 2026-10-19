@@ -24,11 +24,10 @@ const padTimeStr = (t: string) => {
 };
 
 // ==========================================
-// 0. データベース初期化 (バッジテーブル追加 ＆ カラム追加)
+// 0. データベース初期化
 // ==========================================
 app.get('/init', async (c) => {
   try {
-    // 1. バッジ一覧用テーブルの作成
     await c.env.DB.batch([
       c.env.DB.prepare(`
         CREATE TABLE IF NOT EXISTS badges (
@@ -39,17 +38,20 @@ app.get('/init', async (c) => {
       c.env.DB.prepare(`INSERT OR IGNORE INTO badges (name) VALUES ('ステージ'), ('サークルカット'), ('お知らせ'), ('PR企画'), ('ライブ');`)
     ]);
 
-    // 2. タイムテーブルに badge カラムを追加
-    // （※すでにカラムが存在する場合はエラーになるため try-catch で安全に無視します）
     try { 
       await c.env.DB.prepare(`ALTER TABLE timetable ADD COLUMN badge TEXT DEFAULT 'ステージ'`).run(); 
     } catch(e) {}
 
-    return c.text('Database initialized successfully (badge column added)');
+    try { 
+      await c.env.DB.prepare(`ALTER TABLE app_state ADD COLUMN delay_minutes INTEGER DEFAULT 0`).run(); 
+    } catch(e) {}
+
+    return c.text('Database initialized successfully');
   } catch (err: any) {
     return c.text('Init failed: ' + err.message, 500);
   }
 });
+
 // ==========================================
 // 1. バッジ管理 API
 // ==========================================
@@ -94,7 +96,7 @@ app.get('/api/state', async (c) => {
     } catch (_) {}
     
     if (!state) {
-      state = { current_index: -1, is_auto: 1, wait_cm: 0, current_day: 1 }
+      state = { current_index: -1, is_auto: 1, wait_cm: 0, current_day: 1, delay_minutes: 0 }
     }
 
     const currentDay = state.current_day || 1
@@ -104,7 +106,7 @@ app.get('/api/state', async (c) => {
     
     return c.json({ state, timetable: timetable || [] })
   } catch (e: any) {
-    return c.json({ state: { current_index: -1, is_auto: 1, wait_cm: 0, current_day: 1 }, timetable: [] })
+    return c.json({ state: { current_index: -1, is_auto: 1, wait_cm: 0, current_day: 1, delay_minutes: 0 }, timetable: [] })
   }
 })
 
@@ -129,6 +131,10 @@ app.post('/api/state/update', async (c) => {
     if (body.wait_cm !== undefined) {
       updates.push('wait_cm = ?')
       values.push(body.wait_cm ? 1 : 0)
+    }
+    if (body.delay_minutes !== undefined) {
+      updates.push('delay_minutes = ?')
+      values.push(parseInt(body.delay_minutes) || 0)
     }
     
     if (updates.length > 0) {
@@ -503,10 +509,22 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
     .ctrl-time { font-weight: bold; color: #38bdf8; font-size: 13px; }
     .ctrl-title { font-weight: bold; font-size: 15px; color: #fff; word-break: break-all; }
     .ctrl-band { color: #94a3b8; font-size: 13px; word-break: break-all; }
+    
+    .delay-input-row { display: flex; align-items: center; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+    .delay-input { width: 90px !important; padding: 6px 10px !important; font-size: 16px !important; text-align: center; }
+    .delay-btn-group { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+    .delay-btn { background: #334155; color: white; border: none; padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 13px; font-weight: bold; }
+    .delay-btn:hover { background: #475569; }
   </style>
 </head>
 <body>
   <div class="container">
+    <!-- ★ ヘッダー部分に目立つ遅延バッジを追加 -->
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 12px;">
+      <h1 style="margin:0; font-size:22px; color:#f8fafc;">茨香祭 総合管理コンソール</h1>
+      <div id="globalDelayBadge" style="display:none; background:#ea580c; color:white; padding:6px 14px; border-radius:20px; font-weight:bold; font-size:14px; box-shadow:0 0 10px rgba(234,88,12,0.4);">＋0分 遅延中</div>
+    </div>
+
     <div class="tab-nav">
       <button class="tab-btn active" id="tabBtnControl" onclick="switchTab('control')">🎮 進行</button>
       <button class="tab-btn" id="tabBtnTicker" onclick="switchTab('ticker')">📢 テロップ</button>
@@ -522,6 +540,35 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
           <div><div style="font-weight:bold; font-size:14px; margin-bottom:2px; color:#e0f2fe;">🗓️ 配信日程の選択</div><div style="font-size:11px; color:#bae6fd;">現在OBSに連動させるタイムテーブルの日程</div></div>
           <div style="display:flex; gap:8px;"><button id="btnCtrlDay1" class="btn" style="padding:8px 16px; border-radius:8px;" onclick="changeCurrentDay(1)">1日目</button><button id="btnCtrlDay2" class="btn btn-secondary" style="padding:8px 16px; border-radius:8px;" onclick="changeCurrentDay(2)">2日目</button></div>
         </div>
+
+        <div class="setting-box" style="flex-direction: column; align-items: flex-start;">
+          <div style="display:flex; justify-content:space-between; width:100%; align-items:center;">
+            <div>
+              <div style="font-weight:bold; font-size:14px; margin-bottom:2px; color:#fed7aa;">⏱️ 全体遅延オフセット</div>
+              <div style="font-size:11px; color:#94a3b8;">指定した分数だけ、OBS上で定刻に赤線＋変更後時刻を表示します</div>
+            </div>
+            <div style="font-weight:bold; font-size:16px; color:#ea580c;" id="currentDelayLabel">遅延なし (0分)</div>
+          </div>
+          
+          <div class="delay-input-row">
+            <span style="font-size:13px; color:#94a3b8;">自由指定:</span>
+            <input type="number" id="customDelayInput" class="delay-input" min="0" max="180" placeholder="0" value="0">
+            <span style="font-size:14px;">分</span>
+            <button class="btn" style="padding:6px 14px; font-size:13px;" onclick="submitCustomDelay()">設定する</button>
+            <button class="btn btn-danger" style="padding:6px 12px; font-size:13px;" onclick="setDelay(0)">解除(0分)</button>
+          </div>
+
+          <div style="font-size:12px; color:#94a3b8; margin-top:8px;">ワンタップ指定:</div>
+          <div class="delay-btn-group">
+            <button class="delay-btn" onclick="setDelay(5)">+5分</button>
+            <button class="delay-btn" onclick="setDelay(10)">+10分</button>
+            <button class="delay-btn" onclick="setDelay(15)">+15分</button>
+            <button class="delay-btn" onclick="setDelay(20)">+20分</button>
+            <button class="delay-btn" onclick="setDelay(30)">+30分</button>
+            <button class="delay-btn" onclick="setDelay(45)">+45分</button>
+          </div>
+        </div>
+
         <div class="setting-box">
           <div><div style="font-weight:bold; font-size:14px; margin-bottom:2px;">🕒 自動進行モード</div><div style="font-size:11px; color:#94a3b8;">時間に合わせてOBSを自動切り替え</div></div>
           <div class="switch-container"><span id="labelAutoMode" style="font-size:12px; font-weight:bold;">ON</span><label class="switch"><input type="checkbox" id="chkAutoMode" onchange="updateStateSetting()"><span class="slider"></span></label></div>
@@ -593,7 +640,6 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
           <div style="flex:1; min-width:130px;" id="newBadgeGroup">
             <label style="font-size:12px; color:#94a3b8;">バッジ</label>
             <select id="ttBadge">
-              <!-- 動的に生成されます -->
             </select>
           </div>
         </div>
@@ -644,12 +690,10 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
       </div>
       <div class="modal-body">
         <p style="font-size:13px; color:#94a3b8; margin-top:0;">タイムテーブルやOBS画面に表示する「緑色の枠（バッジ）」の種類を追加・削除できます。</p>
-        
         <div style="display:flex; gap:10px; margin-bottom:16px;">
           <input type="text" id="newBadgeName" placeholder="新しいバッジ名 (例: 吹奏楽部)" style="flex:1;">
           <button class="btn" onclick="addBadge()">追加</button>
         </div>
-
         <div id="badgeList" class="list-container">読み込み中...</div>
       </div>
       <div class="modal-footer">
@@ -690,19 +734,16 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
           💡 <strong>Excel / Googleスプレッドシートからそのままコピー＆貼り付けできます</strong><br>
           列の順番 (6列): <code>[開始時刻]   [終了時刻]   [団体名]   [詳細(企画名)]   [種別(ステージ/幕間)]   [バッジ]</code><br>
         </div>
-
         <div class="form-group">
           <label style="font-size:12px; color:#94a3b8;">貼り付けエリア</label>
           <textarea id="importRawText" style="height:120px;" oninput="parseImportText()" placeholder="10:00	10:30	吹奏楽部	オープニング演奏	ステージ	ライブ"></textarea>
         </div>
-
         <div style="display:flex; justify-content:space-between; align-items:center; margin-top:14px;">
           <span style="font-size:13px; font-weight:bold;" id="importStats">解析結果: 0 件</span>
           <label style="display:flex; align-items:center; gap:6px; font-size:13px; cursor:pointer;">
             <input type="checkbox" id="importOverwrite"> 既存のタイムテーブルを全消去して上書きする
           </label>
         </div>
-
         <table class="import-table">
           <thead>
             <tr>
@@ -735,11 +776,22 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
     var parsedBatchItems = [];
     var selectedImageData = '';
     
-    var gState = { current_index: -1, is_auto: 1, wait_cm: 0, current_day: 1 };
+    var gState = { current_index: -1, is_auto: 1, wait_cm: 0, current_day: 1, delay_minutes: 0 };
     var gTimetable = [];
     var gAllTimetable = [];
     var currentEditDay = 1;
     var gBadges = [];
+
+    // ★ 時刻計算用関数
+    function addMinutes(timeStr, minutesToAdd) {
+      if (!timeStr || minutesToAdd === 0) return timeStr;
+      var parts = timeStr.split(':');
+      var h = parseInt(parts[0], 10);
+      var m = parseInt(parts[1], 10) + minutesToAdd;
+      h += Math.floor(m / 60);
+      m = m % 60;
+      return ('0' + h).slice(-2) + ':' + ('0' + m).slice(-2);
+    }
 
     function padTime(t) {
       if (!t) return '';
@@ -786,7 +838,6 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
       if(box) box.style.display = (type === 'song' || type === 'ステージ（演奏・企画）') ? 'block' : 'none';
     }
 
-    // --- バッジ管理 (モーダル) ---
     function openBadgeModal() {
       document.getElementById('badgeModal').classList.add('active');
       loadManageBadges();
@@ -829,7 +880,7 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
         document.getElementById('newBadgeName').value = '';
         showToast("🏷️ 追加しました", false);
         loadManageBadges();
-        loadBadges(); // リストも更新
+        loadBadges();
         loadTimetableList();
       } catch (e) { showToast("❌ 通信エラー", true); }
     }
@@ -840,18 +891,17 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
         await fetch(API_BASE + '/api/badges/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: id }) });
         showToast("🗑️ 削除しました", false);
         loadManageBadges();
-        loadBadges(); // リストも更新
+        loadBadges();
         loadTimetableList();
       } catch (e) { showToast("❌ 通信エラー", true); }
     }
-
 
     // --- 進行コントロール ---
     async function fetchState() {
       try {
         var res = await fetch(API_BASE + '/api/state');
         var data = await res.json();
-        gState = data.state || { current_index: -1, is_auto: 1, wait_cm: 0, current_day: 1 };
+        gState = data.state || { current_index: -1, is_auto: 1, wait_cm: 0, current_day: 1, delay_minutes: 0 };
         gTimetable = data.timetable || [];
         
         var chkAuto = document.getElementById('chkAutoMode');
@@ -870,6 +920,30 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
           lblWait.style.color = gState.wait_cm ? "#10b981" : "#94a3b8";
         }
 
+        // ★遅延表示の反映 (全体ヘッダーバッジと入力欄)
+        var delay = gState.delay_minutes || 0;
+        
+        var globalBadge = document.getElementById('globalDelayBadge');
+        if (globalBadge) {
+          if (delay > 0) {
+            globalBadge.innerText = "🚨 ＋" + delay + "分 遅延中";
+            globalBadge.style.display = "block";
+          } else {
+            globalBadge.style.display = "none";
+          }
+        }
+
+        var delayLbl = document.getElementById('currentDelayLabel');
+        if (delayLbl) {
+          delayLbl.innerText = delay > 0 ? "＋" + delay + "分 遅延中" : "遅延なし (0分)";
+          delayLbl.style.color = delay > 0 ? "#ea580c" : "#94a3b8";
+        }
+        
+        var customInput = document.getElementById('customDelayInput');
+        if (customInput && document.activeElement !== customInput) {
+          customInput.value = delay;
+        }
+
         var btn1 = document.getElementById('btnCtrlDay1');
         var btn2 = document.getElementById('btnCtrlDay2');
         if (gState.current_day === 1) {
@@ -881,7 +955,31 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
         }
 
         renderControlUI();
+        
+        // タイムテーブル管理画面を開いているときはそちらも再描画
+        if (document.getElementById('tabContentTimetable').style.display === 'block') {
+          renderTimetableList();
+        }
       } catch (e) {}
+    }
+
+    // 遅延設定関数（共通）
+    async function setDelay(min) {
+      try {
+        var num = parseInt(min) || 0;
+        await fetch(API_BASE + '/api/state/update', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ delay_minutes: num })
+        });
+        showToast(num > 0 ? "⏱️ 遅延を +" + num + "分 に設定しました" : "⏱️ 遅延を解除しました", false);
+        fetchState();
+      } catch (e) { showToast("❌ 通信エラー", true); }
+    }
+
+    // 手入力欄からの送信
+    function submitCustomDelay() {
+      var val = document.getElementById('customDelayInput').value;
+      setDelay(val);
     }
 
     async function changeCurrentDay(d) {
@@ -921,15 +1019,19 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
       fetchState();
     }
 
+    // ★ 進行コントロールのUI描画（遅延時刻を反映）
     function renderControlUI() {
       if (!gState) return;
       var idx = gState.current_index;
+      var delay = gState.delay_minutes || 0;
       
       var elPrev = document.getElementById('ctrl-prev-title');
       if (elPrev) {
         if (idx > 0 && gTimetable && gTimetable[idx - 1]) {
           var pItem = gTimetable[idx - 1];
-          elPrev.innerText = padTime(pItem.start_time) + "〜" + padTime(pItem.end_time) + " | " + (pItem.title || '');
+          var pS = padTime(pItem.start_time), pE = padTime(pItem.end_time);
+          var tStr = delay > 0 ? pS + "(<span style='color:#fb923c'>" + addMinutes(pS, delay) + "</span>) 〜 " + pE + "(<span style='color:#fb923c'>" + addMinutes(pE, delay) + "</span>)" : pS + " 〜 " + pE;
+          elPrev.innerHTML = tStr + " | " + escapeHtml(pItem.title || '');
         } else { elPrev.innerText = "なし"; }
       }
 
@@ -940,7 +1042,11 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
           var item = gTimetable[idx];
           var typeLabel = (item.type === 'song' || item.type === 'ステージ（演奏・企画）') ? '【ステージ】' : '【幕間CM】';
           elCurr.innerText = typeLabel + " " + (item.title || '');
-          if (elSub) elSub.innerText = (padTime(item.start_time) + " 〜 " + padTime(item.end_time)) + (item.band ? " | " + item.band : "");
+          if (elSub) {
+            var cS = padTime(item.start_time), cE = padTime(item.end_time);
+            var tStrC = delay > 0 ? cS + "(<span style='color:#fb923c'>" + addMinutes(cS, delay) + "</span>) 〜 " + cE + "(<span style='color:#fb923c'>" + addMinutes(cE, delay) + "</span>)" : cS + " 〜 " + cE;
+            elSub.innerHTML = tStrC + (item.band ? " | " + escapeHtml(item.band) : "");
+          }
         } else {
           elCurr.innerText = "待機中・CM映像表示中";
           if (elSub) elSub.innerText = "時間になると自動で開始されます";
@@ -951,7 +1057,9 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
       if (elNext) {
         if (gTimetable && idx + 1 < gTimetable.length && gTimetable[idx + 1]) {
           var nItem = gTimetable[idx + 1];
-          elNext.innerText = padTime(nItem.start_time) + "〜" + padTime(nItem.end_time) + " | " + (nItem.title || '');
+          var nS = padTime(nItem.start_time), nE = padTime(nItem.end_time);
+          var tStrN = delay > 0 ? nS + "(<span style='color:#fb923c'>" + addMinutes(nS, delay) + "</span>) 〜 " + nE + "(<span style='color:#fb923c'>" + addMinutes(nE, delay) + "</span>)" : nS + " 〜 " + nE;
+          elNext.innerHTML = tStrN + " | " + escapeHtml(nItem.title || '');
         } else { elNext.innerText = "なし"; }
       }
 
@@ -962,9 +1070,12 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
           var card = document.createElement('div');
           card.className = 'ctrl-item-card ' + (i === idx ? 'active' : '');
           var isSong = (item.type === 'song' || item.type === 'ステージ（演奏・企画）');
+          var lS = padTime(item.start_time), lE = padTime(item.end_time);
+          var tStrL = delay > 0 ? lS + "(<span style='color:#fb923c'>" + addMinutes(lS, delay) + "</span>) 〜 " + lE + "(<span style='color:#fb923c'>" + addMinutes(lE, delay) + "</span>)" : lS + " 〜 " + lE;
+          
           card.innerHTML = 
-            '<div class="ctrl-item-row"><span class="ctrl-time">🕒 ' + padTime(item.start_time) + ' 〜 ' + padTime(item.end_time) + '</span>' +
-            (isSong ? '<span class="tag tag-song">ステージ</span>' : '<span class="tag tag-break">幕間CM</span>') + '</div>' +
+            '<div class="ctrl-item-row"><span class="ctrl-time">🕒 ' + tStrL + '</span>' +
+            (isSong ? '<span class="tag tag-song" style="font-size:11px;background:#059669;color:white;padding:2px 6px;border-radius:4px;">ステージ</span>' : '<span class="tag tag-break" style="font-size:11px;background:#d97706;color:white;padding:2px 6px;border-radius:4px;">幕間CM</span>') + '</div>' +
             '<div class="ctrl-title">' + escapeHtml(item.title || '') + '</div>' +
             (item.band ? '<div class="ctrl-band">' + escapeHtml(item.band) + '</div>' : '');
           listEl.appendChild(card);
@@ -1110,6 +1221,7 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
       } catch (e) { console.error("Timetable fetch error:", e); }
     }
 
+    // ★ タイムテーブル一覧のUI描画（遅延時刻を反映）
     function renderTimetableList() {
       var listEl = document.getElementById('timetableList');
       if (!listEl) return;
@@ -1122,6 +1234,7 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
       listEl.innerHTML = '';
       
       var badgeOptionsHtml = gBadges.map(b => '<option value="'+escapeHtml(b.name)+'">'+escapeHtml(b.name)+'</option>').join('');
+      var delay = gState.delay_minutes || 0;
 
       items.forEach(function(item) {
         var card = document.createElement('div');
@@ -1134,11 +1247,17 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
         }
         currentBadgeOptions = currentBadgeOptions.replace('value="'+escapeHtml(item.badge||'')+'"', 'value="'+escapeHtml(item.badge||'')+'" selected');
 
-        // ★ここでラベル付きのレイアウトを生成しています
+        var sOrig = padTime(item.start_time);
+        var eOrig = padTime(item.end_time);
+        
+        // 遅延がある場合はラベルの横に (変更後時刻) を目立たせて表示
+        var sLabel = delay > 0 ? '開始時刻 <span style="color:#fb923c; font-weight:bold;">(' + addMinutes(sOrig, delay) + ')</span>' : '開始時刻';
+        var eLabel = delay > 0 ? '終了時刻 <span style="color:#fb923c; font-weight:bold;">(' + addMinutes(eOrig, delay) + ')</span>' : '終了時刻';
+
         card.innerHTML = 
           '<div class="item-header"><div style="display:flex; gap:8px; align-items:flex-end; flex-wrap:wrap;">' +
-            '<div><div style="font-size:11px; color:#94a3b8; margin-bottom:2px;">開始時刻</div><input type="time" id="tt-s-'+item.id+'" value="'+padTime(item.start_time)+'" style="width:110px;"></div><span style="margin-bottom:8px;">〜</span>' +
-            '<div><div style="font-size:11px; color:#94a3b8; margin-bottom:2px;">終了時刻</div><input type="time" id="tt-e-'+item.id+'" value="'+padTime(item.end_time)+'" style="width:110px;"></div>' +
+            '<div><div style="font-size:11px; color:#94a3b8; margin-bottom:2px;">' + sLabel + '</div><input type="time" id="tt-s-'+item.id+'" value="'+sOrig+'" style="width:110px;"></div><span style="margin-bottom:8px;">〜</span>' +
+            '<div><div style="font-size:11px; color:#94a3b8; margin-bottom:2px;">' + eLabel + '</div><input type="time" id="tt-e-'+item.id+'" value="'+eOrig+'" style="width:110px;"></div>' +
             '<div><div style="font-size:11px; color:#94a3b8; margin-bottom:2px;">種別</div><select id="tt-t-'+item.id+'" style="width:120px;" onchange="toggleEditBadgeSelect('+item.id+')">' +
               '<option value="song"'+(isSong?' selected':'')+'>ステージ</option>' +
               '<option value="break"'+((!isSong)?' selected':'')+'>幕間CM</option>' +
@@ -1202,7 +1321,6 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
     function openImportModal() { document.getElementById('importModal').classList.add('active'); document.getElementById('importRawText').focus(); }
     function closeImportModal() { document.getElementById('importModal').classList.remove('active'); }
 
-    // 6列対応パース
     function parseImportText() {
       var text = document.getElementById('importRawText').value;
       var tbody = document.getElementById('importPreviewBody');
@@ -1218,10 +1336,10 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
         if (!line) continue;
         var cols = (line.indexOf('\\t') !== -1) ? line.split('\\t') : line.split(',');
         var startTime = padTime((cols[0] || '').trim()), endTime = padTime((cols[1] || '').trim());
-        var band = (cols[2] || '').trim();  // 3列目が団体名
-        var title = (cols[3] || '').trim(); // 4列目が詳細
+        var band = (cols[2] || '').trim();
+        var title = (cols[3] || '').trim();
         var type = ((cols[4] || '').indexOf('幕間') !== -1 || (cols[4] || '').indexOf('CM') !== -1) ? 'break' : 'song';
-        var badge = (cols[5] || '').trim() || 'ステージ'; // 6列目がバッジ
+        var badge = (cols[5] || '').trim() || 'ステージ';
         var error = (!startTime || !endTime) ? '時刻不正' : (startTime >= endTime ? '時間逆転' : (!title ? '企画名空欄' : ''));
         parsed.push({ idx: parsed.length + 1, start_time: startTime, end_time: endTime, title: title, band: band, type: type, badge: badge, error: error });
       }
@@ -1312,7 +1430,7 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
           card.innerHTML = 
             '<div class="item-header" style="margin-bottom:12px;"><label style="display:flex; align-items:center; gap:8px;"><input type="checkbox" id="side-check-'+item.id+'"'+(item.is_active?' checked':'')+' onchange="updateSidebar('+item.id+')"><strong style="color:'+(item.is_active?'#38bdf8':'#94a3b8')+'">'+(item.is_active?'● 表示中':'✕ 非表示')+'</strong></label><div>表示秒数: <input type="number" id="side-dur-'+item.id+'" value="'+(item.duration||10)+'" style="width:60px;"></div></div>' +
             (item.image_data ? '<img src="'+item.image_data+'" class="thumb-preview">' : '') +
-            '<div style="display:flex; flex-direction:column; gap:8px; margin-bottom:12px;"><input type="text" id="side-title-'+item.id+'" value="'+escapeHtml(item.title)+'"><textarea id="side-desc-'+item.id+'">'+escapeHtml(item.description||'')+'</textarea></div>' +
+            '<div style="display:flex; flex-direction:column; gap:8px; margin-bottom:12px;"><input type="text" id="side-title-'+item.id+'" value="' + escapeHtml(item.title) + '"><textarea id="side-desc-'+item.id+'">'+escapeHtml(item.description||'')+'</textarea></div>' +
             '<div style="display:flex; justify-content:flex-end; gap:8px;"><button class="btn btn-save" onclick="updateSidebar('+item.id+', this)">変更保存</button><button class="btn btn-danger" onclick="deleteSidebar('+item.id+')">削除</button></div>';
           listEl.appendChild(card);
         });
@@ -1338,7 +1456,6 @@ const HTML_ADMIN_PAGE = `<!DOCTYPE html>
 
     function escapeHtml(str) { return (str || '').replace(/[&<>'"]/g, function(t) { return {'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[t] || t; }); }
 
-    // 初期化
     loadBadges().then(() => setEditDay(1));
     switchTab('control');
   </script>
