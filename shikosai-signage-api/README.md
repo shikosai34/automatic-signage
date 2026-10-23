@@ -1,21 +1,10 @@
-```txt
+# Hono ローカル配信管理アプリ
+
+起動、OBSシーンコレクションの取り込み、CSV、ローカル保存先の説明はリポジトリの [README](../README.md) を参照してください。
+
+```powershell
 npm install
 npm run dev
 ```
 
-```txt
-npm run deploy
-```
-
-[For generating/synchronizing types based on your Worker configuration run](https://developers.cloudflare.com/workers/wrangler/commands/#types):
-
-```txt
-npm run cf-typegen
-```
-
-Pass the `CloudflareBindings` as generics when instantiating `Hono`:
-
-```ts
-// src/index.ts
-const app = new Hono<{ Bindings: CloudflareBindings }>()
-```
+`src/` にHono API、OBS WebSocket制御、SQLite初期化を分離しています。永続データは `data/` に保存します。

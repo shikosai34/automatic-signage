@@ -1,0 +1,3 @@
+# Broadcast media stays on the local machine and is referenced by path.
+/CM/*.mp4
+/mov_hts-samp*.mp4

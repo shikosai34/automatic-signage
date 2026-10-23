@@ -10,5 +10,16 @@
       "database_name": "signage-db",
       "database_id": "145a4780-fbdb-4766-8981-1ec06d597735"
     }
-  ]
+  ],
+  "r2_buckets": [
+    {
+      "binding": "R2",
+      "bucket_name": "shikosai-signage-backups"
+    }
+  ],
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "run_worker_first": true
+  }
 }
