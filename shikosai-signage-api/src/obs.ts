@@ -71,10 +71,20 @@ export class ObsController {
   async status() {
     try {
       await this.connect()
-      const current = await this.client.call('GetCurrentProgramScene')
-      return { online: true, current_scene: current.currentProgramSceneName, error: '' }
+      const [current, stream, recording] = await Promise.all([
+        this.client.call('GetCurrentProgramScene'),
+        this.client.call('GetStreamStatus'),
+        this.client.call('GetRecordStatus'),
+      ])
+      return {
+        online: true,
+        current_scene: current.currentProgramSceneName,
+        streaming: stream.outputActive,
+        recording: recording.outputActive,
+        error: '',
+      }
     } catch {
-      return { online: false, current_scene: '', error: this.lastError || 'OBS WebSocketに接続できません。' }
+      return { online: false, current_scene: '', streaming: false, recording: false, error: this.lastError || 'OBS WebSocketに接続できません。' }
     }
   }
 
@@ -82,6 +92,12 @@ export class ObsController {
     await this.connect()
     const result = await this.client.call('GetSceneList')
     return result.scenes.map((scene) => scene.sceneName)
+  }
+
+  async inputs() {
+    await this.connect()
+    const result = await this.client.call('GetInputList')
+    return result.inputs.map((input) => ({ name: input.inputName, kind: input.inputKind }))
   }
 
   async switchScene(sceneName: string) {

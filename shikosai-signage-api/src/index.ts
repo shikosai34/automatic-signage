@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, resolve, sep } from 'node:path'
 import type { LocalDatabase, LocalStatement } from './database.js'
 import type { ObsController } from './obs.js'
+import { selectCommercials, secondsUntilStart } from './cm-selection.js'
 
 
 type Program = {
@@ -17,6 +18,7 @@ type Program = {
   class_name: string
   circle_slug: string
   media_path: string
+  is_demo?: number
 }
 
 type CatalogRecord = {
@@ -41,17 +43,39 @@ const asset = (name?: string) => (c: any) => c.html(adminHtml)
 let cmGeneration = 0
 let cmTimer: ReturnType<typeof setTimeout> | undefined
 const cmInput = process.env.OBS_CM_SOURCE || 'CM映像'
-const stopCmQueue = async () => { cmGeneration += 1; if (cmTimer) clearTimeout(cmTimer); cmTimer = undefined; await obs.stopMedia(cmInput).catch(() => {}) }
+let cmActionQueue: Promise<void> = Promise.resolve()
+const enqueueCmAction = <T>(action: () => Promise<T>) => {
+  const result = cmActionQueue.then(action, action)
+  cmActionQueue = result.then(() => undefined, () => undefined)
+  return result
+}
+const stopCmQueue = async () => {
+  cmGeneration += 1
+  if (cmTimer) clearTimeout(cmTimer)
+  cmTimer = undefined
+  await enqueueCmAction(() => obs.stopMedia(cmInput)).catch(() => {})
+}
 const playNextCm = async () => {
   const generation = cmGeneration
   const screen = await screenData(db)
+  if (generation !== cmGeneration) return
   const ad = screen.playlist[0]
-  if (!ad) { await obs.stopMedia(cmInput).catch(() => {}); return }
+  if (!ad) {
+    await enqueueCmAction(async () => {
+      if (generation === cmGeneration) await obs.stopMedia(cmInput).catch(() => {})
+    })
+    return
+  }
   const root = resolve(process.env.SIGNAGE_MEDIA_ROOT || resolve(import.meta.dirname, '../../CM'))
   const media = resolve(root, String(ad.media_path).replace(/[\\/]+/g, sep))
   if (media !== root && !media.startsWith(root + sep)) throw new Error('CMパスはメディアルート内を指定してください。')
   if (!existsSync(media)) throw new Error(`CMファイルが見つかりません: ${ad.media_path}`)
-  await obs.playMedia(cmInput, media)
+  const started = await enqueueCmAction(async () => {
+    if (generation !== cmGeneration) return false
+    await obs.playMedia(cmInput, media)
+    return generation === cmGeneration
+  })
+  if (!started) return
   await db.batch([
     db.prepare('UPDATE commercials SET play_count=play_count+1,last_played_at=CURRENT_TIMESTAMP WHERE id=?').bind(ad.id),
     db.prepare('INSERT INTO playback_history (commercial_id,break_key) VALUES (?,?)').bind(ad.id, screen.break_key),
@@ -59,7 +83,14 @@ const playNextCm = async () => {
   if (generation !== cmGeneration) return
   cmTimer = setTimeout(() => { void playNextCm().catch((error) => console.error('CM selection failed:', error.message)) }, Math.max(1000, Math.min(ad.duration_seconds * 1000, screen.gap_seconds * 1000)))
 }
-const nowJst = () => new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Tokyo', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(new Date())
+const nowJstMoment = () => {
+  const parts = Object.fromEntries(new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Asia/Tokyo', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23',
+  }).formatToParts(new Date()).map((part) => [part.type, part.value]))
+  const hour = Number(parts.hour)
+  const minute = Number(parts.minute)
+  return { clock: `${parts.hour}:${parts.minute}`, minutes: hour * 60 + minute, second: Number(parts.second) }
+}
 const padTime = (value: string) => {
   const match = /^\s*(\d{1,2}):(\d{1,2})\s*$/.exec(value || '')
   return match ? `${match[1].padStart(2, '0')}:${match[2].padStart(2, '0')}` : ''
@@ -126,12 +157,13 @@ const csvValue = (row: Record<string, string>, ...keys: string[]) => {
   return ''
 }
 
-async function loadPrograms(db: LocalDatabase, day: number): Promise<Program[]> {
-  const result = await db.prepare('SELECT * FROM programs WHERE day = ? ORDER BY COALESCE(NULLIF(adjusted_start, \'\'), scheduled_start), display_order, id').bind(day).all<Program>()
+async function loadPrograms(db: LocalDatabase, day: number, includeDemo = false): Promise<Program[]> {
+  const demoFilter = includeDemo ? '' : ' AND is_demo = 0'
+  const result = await db.prepare(`SELECT * FROM programs WHERE day = ?${demoFilter} ORDER BY COALESCE(NULLIF(adjusted_start, ''), scheduled_start), display_order, id`).bind(day).all<Program>()
   return result.results || []
 }
 
-async function buildPlaylist(db: LocalDatabase, day: number, gapSeconds: number, breakKey: string, syncedSlug = '') {
+async function buildPlaylist(db: LocalDatabase, gapSeconds: number, breakKey: string) {
   if (gapSeconds <= 0) return []
   const result = await db.prepare(`
     SELECT cm.*, COALESCE(cc.preference_score, 0) AS circle_preference,
@@ -146,64 +178,49 @@ async function buildPlaylist(db: LocalDatabase, day: number, gapSeconds: number,
     GROUP BY commercial_id
   `).all<{ commercial_id: number; recent_count: number }>()
   const usedInBreak = await db.prepare('SELECT commercial_id FROM playback_history WHERE break_key = ?').bind(breakKey).all<{ commercial_id: number }>()
-  const recentCounts = new Map((recent.results || []).map(item => [item.commercial_id, item.recent_count]))
   const alreadyUsed = new Set((usedInBreak.results || []).map(item => item.commercial_id))
-  const ads = (result.results || []).map((ad: any) => ({ ...ad }))
-  const averagePlays = ads.length ? ads.reduce((total: number, ad: any) => total + int(ad.play_count, 0, 0, 1000000), 0) / ads.length : 0
-  const prioritizedAds = ads.map((ad: any) => ({
+  const recentCounts = new Map((recent.results || []).map(item => [item.commercial_id, item.recent_count]))
+  const candidates = (result.results || []).map((ad: any) => ({
     ...ad,
-    duration_seconds: Math.max(1, int(ad.duration_seconds, 15, 1, 3600)),
-    score: int(ad.preference_score, 0, -10, 10) * 3 + int(ad.circle_preference, 0, -10, 10) * 2 - (recentCounts.get(ad.id) || 0) * 8 + (averagePlays - int(ad.play_count, 0, 0, 1000000)) * 0.5,
-  })).filter((ad: any) => !alreadyUsed.has(ad.id))
-
-  // Favor the selected circle when synchronization is enabled, then fill the
-  // remaining gap with high-priority, underplayed items that still fit.
-  prioritizedAds.sort((a: any, b: any) => {
-    const syncBoostA = syncedSlug && a.circle_slug === syncedSlug ? 100 : 0
-    const syncBoostB = syncedSlug && b.circle_slug === syncedSlug ? 100 : 0
-    return (b.score + syncBoostB) - (a.score + syncBoostA) || a.duration_seconds - b.duration_seconds || a.id - b.id
-  })
-  const selected: any[] = []
-  const perCircle = new Map<string, number>()
-  let remaining = gapSeconds
-  for (const ad of prioritizedAds) {
-    const circleSlug = ad.circle_slug || `ad-${ad.id}`
-    const used = perCircle.get(circleSlug) || 0
-    if (ad.duration_seconds > remaining || used >= Math.max(1, int(ad.max_per_break, 1, 1, 20))) continue
-    selected.push({
-      id: ad.id,
-      title: ad.title,
-      circle_slug: ad.circle_slug,
-      circle_name: ad.circle_name,
-      media_path: ad.media_path,
-      duration_seconds: ad.duration_seconds,
-      circle_cut_path: ad.circle_cut_path,
-    })
-    remaining -= ad.duration_seconds
-    perCircle.set(circleSlug, used + 1)
-    if (remaining <= 0) break
-  }
-  return selected
+    recent_count: recentCounts.get(ad.id) || 0,
+  }))
+  return selectCommercials(candidates, gapSeconds, alreadyUsed)
 }
 
-async function screenData(db: LocalDatabase) {
+async function screenData(db: LocalDatabase, previewDemo = false) {
   const state = await db.prepare('SELECT * FROM signage_state WHERE id = 1').first<any>() || { current_day: 1, wait_cm: 1, delay_minutes: 0, sidebar_mode: 'sync', current_scene_mode: 'program' }
   const day = int(state.current_day, 1, 1, 7)
-  const programs = await loadPrograms(db, day)
-  const currentMinutes = timeToMinutes(nowJst())
+  const loadedPrograms = await loadPrograms(db, day, previewDemo)
+  const programs = previewDemo ? loadedPrograms.filter((program) => Number(program.is_demo) === 1) : loadedPrograms
+  const now = nowJstMoment()
+  const currentMinutes = now.minutes
   const effectiveStart = (program: Program) => timeToMinutes(program.adjusted_start || program.scheduled_start)
   let scheduledIndex = -1
   programs.forEach((program, index) => { if (effectiveStart(program) <= currentMinutes) scheduledIndex = index })
-  const current = scheduledIndex >= 0 ? programs[scheduledIndex] : null
-  const next = programs.find(program => program.kind !== 'break' && effectiveStart(program) > currentMinutes) || null
+  let current = scheduledIndex >= 0 ? programs[scheduledIndex] : null
+  let next = programs.find(program => program.kind !== 'break' && effectiveStart(program) > currentMinutes) || null
+  if (previewDemo && programs.length) {
+    scheduledIndex = 0
+    current = programs[0]
+    next = programs.slice(1).find(program => program.kind !== 'break') || null
+  }
   const breakNow = state.current_scene_mode === 'cm' || current?.kind === 'break' || (!current && !!next)
-  const gapEnd = next
-  const gapSeconds = breakNow && gapEnd ? Math.max(0, (effectiveStart(gapEnd) - currentMinutes) * 60) : 0
+  const cmTarget = !previewDemo && state.current_scene_mode === 'cm' && state.cm_target_program_id
+    ? programs.find((program) => Number(program.id) === Number(state.cm_target_program_id)) || null
+    : null
+  const gapEnd = state.current_scene_mode === 'cm' && !previewDemo ? cmTarget : next
+  const gapSeconds = breakNow && gapEnd
+    ? secondsUntilStart(effectiveStart(gapEnd), currentMinutes, now.second)
+    : 0
+  const nextForDisplay = state.current_scene_mode === 'cm' && cmTarget && effectiveStart(cmTarget) <= currentMinutes
+    ? next
+    : gapEnd || next
   const breakKey = `${day}:${current?.id ?? 'gap'}:${gapEnd?.id ?? 'end'}`
   const notices = await db.prepare('SELECT * FROM announcements WHERE is_active = 1 ORDER BY is_emergency DESC, display_order ASC, id DESC').all<any>()
+  const previewNotices = previewDemo ? await db.prepare("SELECT * FROM announcements WHERE text LIKE '【デモ】%' ORDER BY id DESC LIMIT 1").all<any>() : { results: [] }
   const catalog = await db.prepare('SELECT * FROM circle_catalog WHERE is_active = 1 ORDER BY display_order ASC, name ASC').all<any>()
-  const playlist = state.wait_cm && breakNow ? await buildPlaylist(db, day, gapSeconds, breakKey, current?.circle_slug || '') : []
   const mode = state.sidebar_mode === 'independent' ? 'independent' : 'sync'
+  const playlist = state.wait_cm && breakNow ? await buildPlaylist(db, gapSeconds, breakKey) : []
   let sidebar: any = null
   if (mode === 'sync' && playlist.length) sidebar = catalog.results?.find((circle: any) => circle.slug === playlist[0].circle_slug) || null
   if (mode === 'sync' && !sidebar && current?.circle_slug) sidebar = catalog.results?.find((circle: any) => circle.slug === current.circle_slug) || null
@@ -211,7 +228,11 @@ async function screenData(db: LocalDatabase) {
     const rotationIndex = Math.floor(Date.now() / 12000) % catalog.results.length
     sidebar = catalog.results[rotationIndex]
   }
-  return { state, day, now: nowJst(), current, next, current_index: scheduledIndex, gap_seconds: gapSeconds, break_key: breakKey, playlist, notices: notices.results || [], sidebar, sidebar_mode: mode }
+  const visibleNotices = [
+    ...(notices.results || []),
+    ...(previewNotices.results || []).map((notice: any) => ({ ...notice, is_active: 1 })),
+  ]
+  return { state, day, now: now.clock, current, next: nextForDisplay, current_index: scheduledIndex, gap_seconds: gapSeconds, break_key: breakKey, playlist, notices: visibleNotices, sidebar, sidebar_mode: mode, demo_preview: previewDemo }
 }
 
 app.get('/', asset('admin.html'))
@@ -222,6 +243,10 @@ app.get('/broadcast.html', (c) => c.html(broadcastHtml))
 app.get('/api/health', (c) => c.json({ ok: true, storage: 'SQLite', mediaUploads: false, obs: 'local-websocket' }))
 app.get('/api/obs/status', async (c) => c.json(await obs.status()))
 app.get('/api/obs/config', (c) => c.json(obs.connectionSettings()))
+app.get('/api/obs/inputs', async (c) => {
+  try { return c.json({ inputs: await obs.inputs() }) }
+  catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 503) }
+})
 app.post('/api/obs/config', async (c) => {
   const denied = await requireAdmin(c); if (denied) return denied
   const body = await c.req.json<any>()
@@ -237,7 +262,25 @@ app.get('/api/obs/scenes', async (c) => {
 app.post('/api/obs/scene', async (c) => {
   const denied = await requireAdmin(c); if (denied) return denied
   const body = await c.req.json<any>()
-  try { const result = await obs.switchScene(text(body.scene_name, 120)); const mode = body.mode === 'cm' ? 'cm' : 'program'; await db.prepare('UPDATE signage_state SET current_scene_mode=?,updated_at=CURRENT_TIMESTAMP WHERE id=1').bind(mode).run(); if (mode === 'cm') { cmGeneration += 1; if (cmTimer) clearTimeout(cmTimer); cmTimer = undefined; await playNextCm() } else await stopCmQueue(); return c.json(result) }
+  try {
+    const mode = body.mode === 'cm' ? 'cm' : 'program'
+    const previous = await db.prepare('SELECT current_scene_mode,cm_target_program_id FROM signage_state WHERE id=1').first<any>()
+    const targetId = mode === 'cm'
+      ? previous?.current_scene_mode === 'cm'
+        ? previous.cm_target_program_id ?? null
+        : (await screenData(db)).next?.id ?? null
+      : null
+    const result = await obs.switchScene(text(body.scene_name, 120))
+    await db.prepare('UPDATE signage_state SET current_scene_mode=?,cm_target_program_id=?,updated_at=CURRENT_TIMESTAMP WHERE id=1').bind(mode, targetId).run()
+    if (mode === 'cm') {
+      cmGeneration += 1
+      if (cmTimer) clearTimeout(cmTimer)
+      cmTimer = undefined
+      try { await playNextCm() }
+      catch (error) { return c.json({ ...result, target_program_id: targetId, cm_warning: error instanceof Error ? error.message : String(error) }) }
+    } else await stopCmQueue()
+    return c.json({ ...result, target_program_id: targetId })
+  }
   catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 400) }
 })
 app.post('/api/obs/text', async (c) => {
@@ -263,18 +306,19 @@ app.post('/api/obs/publish', async (c) => {
 })
 
 app.get('/api/broadcast-state', async (c) => {
-  const screen = await screenData(db)
-  return c.json({ now: screen.now, current: screen.current, next: screen.next, notices: screen.notices, sidebar: screen.sidebar, sidebar_mode: screen.sidebar_mode })
+  const demoPreview = c.req.query('demo') === '1'
+  const screen = await screenData(db, demoPreview)
+  return c.json({ now: screen.now, current: screen.current, next: screen.next, notices: screen.notices, sidebar: screen.sidebar, sidebar_mode: screen.sidebar_mode, mode: screen.state.current_scene_mode, demo_preview: screen.demo_preview })
 })
 
 app.get('/api/state', async (c) => {
   const screen = await screenData(db)
-  return c.json({ state: screen.state, timetable: await loadPrograms(db, screen.day), playback: screen })
+  return c.json({ state: screen.state, timetable: await loadPrograms(db, screen.day, true), playback: screen })
 })
 
 app.get('/api/timetable', async (c) => {
   const day = int(c.req.query('day'), 1, 1, 7)
-  return c.json(await loadPrograms(db, day))
+  return c.json(await loadPrograms(db, day, true))
 })
 
 app.post('/api/timetable/import', async (c) => {
@@ -304,6 +348,7 @@ app.post('/api/timetable/import', async (c) => {
   if (!overwrite && current.length) return c.json({ error: 'この日の企画データがあります。上書きする場合は確認欄を選択してください。' }, 409)
   const statements: LocalStatement[] = []
   if (overwrite) statements.push(db.prepare('DELETE FROM programs WHERE day = ?').bind(day))
+  else statements.push(db.prepare('DELETE FROM programs WHERE day = ? AND is_demo = 1').bind(day))
   for (const [order, item] of sorted.entries()) statements.push(db.prepare(`
     INSERT INTO programs (day, title, description, scheduled_start, adjusted_start, end_time, kind, class_name, circle_slug, media_path, display_order)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -328,11 +373,19 @@ app.post('/api/timetable', async (c) => {
 app.post('/api/timetable/update', async (c) => {
   const denied = await requireAdmin(c); if (denied) return denied
   const body = await c.req.json<any>()
+  const id = int(body.id, 0, 1)
+  const existing = await db.prepare('SELECT * FROM programs WHERE id=?').bind(id).first<Program>()
+  if (!existing) return c.json({ error: '企画が見つかりません。' }, 404)
+  const title = text(body.title, 200)
   const scheduledStart = padTime(body.scheduled_start || body.start_time)
   const adjustedStart = padTime(body.adjusted_start)
   const endTime = padTime(body.end_time) || adjustedStart || scheduledStart
-  await db.prepare(`UPDATE programs SET title=?,description=?,scheduled_start=?,adjusted_start=?,end_time=?,kind=?,class_name=?,circle_slug=?,media_path=? WHERE id=?`)
-    .bind(text(body.title, 200), text(body.description, 2000), scheduledStart, adjustedStart, endTime, body.kind === 'break' ? 'break' : 'program', text(body.class_name, 80), text(body.circle_slug, 120), text(body.media_path, 500), int(body.id)).run()
+  if (!title || timeToMinutes(scheduledStart) < 0 || (endTime && timeToMinutes(endTime) <= timeToMinutes(adjustedStart || scheduledStart))) {
+    return c.json({ error: '企画名と開始・終了時間を確認してください。' }, 400)
+  }
+  const isDemo = body.is_demo === undefined ? null : body.is_demo ? 1 : 0
+  await db.prepare(`UPDATE programs SET title=?,description=?,scheduled_start=?,adjusted_start=?,end_time=?,kind=?,class_name=?,circle_slug=?,media_path=?,is_demo=COALESCE(?,is_demo) WHERE id=?`)
+    .bind(title, text(body.description, 2000), scheduledStart, adjustedStart, endTime, body.kind === 'break' ? 'break' : 'program', text(body.class_name, 80), text(body.circle_slug, 120), text(body.media_path, 500), isDemo, id).run()
   return c.json({ success: true })
 })
 

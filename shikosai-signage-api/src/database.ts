@@ -21,7 +21,7 @@ export function openDatabase() {
   sqlite.pragma('foreign_keys = ON')
   sqlite.exec(`CREATE TABLE IF NOT EXISTS schema_migrations (name TEXT PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)`)
   const migrationDirectory = resolve(import.meta.dirname, '../migrations')
-  const migrationFiles = ['0001_local_signage.sql', '0002_manual_obs_scene.sql']
+  const migrationFiles = ['0001_local_signage.sql', '0002_manual_obs_scene.sql', '0003_demo_programs.sql', '0004_cm_target_program.sql']
   for (const name of migrationFiles) {
     const applied = sqlite.prepare('SELECT 1 FROM schema_migrations WHERE name = ?').get(name)
     if (applied) continue

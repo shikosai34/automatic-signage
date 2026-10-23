@@ -2,6 +2,8 @@
 
 Hono管理画面、OBS、SQLiteを配信PC上で動かすローカルアプリです。OBSが映像を配信し、`/broadcast` はOBSブラウザソースに重ねるテロップとして動作します。CM動画のデータはサーバーやGitに置かず、PC内のファイルパスだけを管理します。
 
+Windows配信PCへの初回設定と当日の操作は、[セットアップ・運用手順](docs/SETUP.md)を参照してください。
+
 ## Windowsで起動
 
 1. Node.js 22 LTSとOBS Studioをインストールします。
@@ -15,7 +17,7 @@ $env:SIGNAGE_MEDIA_ROOT = "..\CM"
 npm run dev
 ```
 
-管理画面は <http://127.0.0.1:8787/admin>、OBSのブラウザソースURLは <http://127.0.0.1:8787/broadcast> です。管理画面の「ローカル設定 → OBS WebSocket」でポートとパスワードを設定できます。接続情報は `shikosai-signage-api/data/obs-connection.json` にローカル保存され、Git管理対象外です。サーバーは `127.0.0.1` のみで待ち受けます。SQLiteデータとバックアップも `shikosai-signage-api/data/` に作成されます。
+管理画面は <http://127.0.0.1:8787/admin>、OBSのブラウザソースURLは <http://127.0.0.1:8787/broadcast> です。デモ表示は <http://127.0.0.1:8787/broadcast?demo=1> で確認できます（OBSソースには通常URLを設定してください）。管理画面の「ローカル設定 → OBS WebSocket」でポートとパスワードを設定できます。接続情報は `shikosai-signage-api/data/obs-connection.json` にローカル保存され、Git管理対象外です。サーバーは `127.0.0.1` のみで待ち受けます。SQLiteデータとバックアップも `shikosai-signage-api/data/` に作成されます。
 
 OBSのWebSocket認証を無効にしている場合、パスワード欄は空のままで接続できます。シーン切替ボタンは企画/CMを選択したときだけOBSシーンを切り替え、時刻到来時にシーンを自動変更しません。CMシーンへ切り替えた後は、残り時間に収まるCMを選んでOBSの `CM映像` メディアソースへ順番に読み込みます。
 
@@ -30,6 +32,8 @@ OBSのWebSocket認証を無効にしている場合、パスワード欄は空�
 - `shikosai-signage-api/public/broadcast.html`: 1920×1080のOBSオーバーレイ。映像の配信はOBSが担当します。
 - `shikosai-signage-api/migrations/`: SQLiteスキーマ。
 - `seed/shikosai-catalog.json`: 公式サイトの公開情報から作成した初期カタログ。初回起動時に64件がSQLiteへ登録されます。画像本体は取得せず、公開URLと説明文のみ保持します。
+- プログラム表が空の場合、起動時に7件の `【デモ】` 企画が登録されます。デモ企画は管理画面だけで確認でき、OBS配信データから除外されます。実企画をCSVで読み込むとデモ行は置き換わります。
+- タイムライン各行の `▶ 設定` から、開催時刻・説明・クラス名・サークルカットをその場で編集できます。企画／CMシーン切替は手動です。
 - `scripts/scrape_shikosai_catalog.py`: 公式サイトの公開ページからカタログJSONを再生成します。
 - `CM/`: ローカルCM動画フォルダ。CM登録画面にはこのフォルダからの相対パスを入力します。
 
