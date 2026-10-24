@@ -151,45 +151,6 @@
       font-weight: bold;
       text-shadow: 0 0 6px rgba(255, 77, 79, 0.6);
     }
-
-    /* 2段目：次（細長バー） */
-    .next-box {
-      display: inline-flex;
-      align-items: center;
-      gap: 12px;
-      background: rgba(10, 25, 40, 0.9);
-      border-left: 4px solid #FF9933;
-      border-top: 1px solid rgba(255, 153, 51, 0.3);
-      border-right: 1px solid rgba(255, 153, 51, 0.3);
-      border-bottom: 1px solid rgba(255, 153, 51, 0.3);
-      padding: 4px 18px 4px 12px;
-      border-radius: 0 6px 6px 0;
-      white-space: nowrap;
-      box-shadow: 2px 2px 8px rgba(0, 0, 0, 0.4);
-      width: fit-content;
-      max-width: 100%;
-    }
-
-    .next-tag {
-      font-size: 14px;
-      font-weight: 500;
-      color: #FF9933;
-      letter-spacing: 1px;
-    }
-
-    .next-time {
-      font-size: 16px;
-      font-weight: 500;
-      color: #00FFCC;
-      letter-spacing: 0.5px;
-    }
-
-    .next-title {
-      font-size: 18px;
-      font-weight: 400;
-      color: #F1F5F9;
-      letter-spacing: 1px;
-    }
   </style>
 </head>
 <body>
@@ -208,12 +169,6 @@
       <div class="right-time-area">
         <span class="end-time-inside" id="progEndTime">終了 --:-- まで</span>
       </div>
-    </div>
-
-    <div class="next-box" id="nextBox" style="display: none;">
-      <span class="next-tag">NEXT ▶</span>
-      <span class="next-time" id="nextTime"></span>
-      <span class="next-title" id="nextTitle"></span>
     </div>
   </div>
 
@@ -272,9 +227,6 @@
         const mainEl = document.getElementById('progMain');
         const subEl = document.getElementById('progSub');
         const endTimeEl = document.getElementById('progEndTime');
-        const nextBox = document.getElementById('nextBox');
-        const nextTime = document.getElementById('nextTime');
-        const nextTitle = document.getElementById('nextTitle');
 
         if (currentIndex >= 0 && timetable[currentIndex]) {
           const item = timetable[currentIndex];
@@ -289,6 +241,7 @@
           const bandText = (item.band || '').trim();
           const titleText = (item.title || '').trim();
 
+          // ★ 詳細（titleText）が空欄の場合は自動的に非表示にする処理
           if (bandText && titleText) {
             mainEl.innerText = bandText;
             subEl.innerText = titleText;
@@ -305,27 +258,6 @@
             endTimeEl.innerHTML = `終了 <span class="time-orig-struck">${origEnd}</span><span class="time-delayed">${delayedEnd}</span> まで`;
           } else {
             endTimeEl.innerText = `終了 ${origEnd} まで`;
-          }
-
-          // ★ 次の演目：開始時間の遅延表示
-          if (currentIndex + 1 < timetable.length) {
-            const nextItem = timetable[currentIndex + 1];
-            const nBand = (nextItem.band || '').trim();
-            const nTitle = (nextItem.title || '').trim();
-            const displayTitle = nBand && nTitle ? `${nBand} - ${nTitle}` : (nBand || nTitle || '未定');
-
-            const origStart = padTime(nextItem.start_time);
-            if (delay > 0) {
-              const delayedStart = addMinutes(origStart, delay);
-              nextTime.innerHTML = `<span class="time-orig-struck">${origStart}</span><span class="time-delayed">${delayedStart}</span>〜`;
-            } else {
-              nextTime.innerText = `${origStart}〜`;
-            }
-
-            nextTitle.innerText = displayTitle;
-            nextBox.style.display = 'inline-flex';
-          } else {
-            nextBox.style.display = 'none';
           }
 
           container.style.display = 'flex';

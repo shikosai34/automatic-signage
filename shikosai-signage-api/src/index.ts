@@ -1,532 +1,1186 @@
 import { Hono } from 'hono'
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
-import { dirname, resolve, sep } from 'node:path'
-import type { LocalDatabase, LocalStatement } from './database.js'
-import type { ObsController } from './obs.js'
-import { selectCommercials, secondsUntilStart } from './cm-selection.js'
+import { cors } from 'hono/cors'
 
-
-type Program = {
-  id: number
-  day: number
-  title: string
-  description: string
-  scheduled_start: string
-  adjusted_start: string
-  end_time: string
-  kind: string
-  class_name: string
-  circle_slug: string
-  media_path: string
-  is_demo?: number
+type Bindings = {
+  GEMINI_API_KEY: string
+  DB: D1Database
 }
 
-type CatalogRecord = {
-  slug: string
-  name: string
-  kind?: string
-  class_name?: string
-  group_name?: string
-  description?: string
-  program_description?: string
-  circle_cut_path?: string
-  circle_cut_alt?: string
-  source_url?: string
-}
+const app = new Hono<{ Bindings: Bindings }>()
+app.use('*', cors())
 
-export function createApp(db: LocalDatabase, obs: ObsController) {
-const app = new Hono()
-obs.onMediaEnded((inputName) => { if (inputName === cmInput) { void db.prepare('SELECT current_scene_mode FROM signage_state WHERE id=1').first<any>().then((row) => { if (row?.current_scene_mode !== 'cm') return; if (cmTimer) clearTimeout(cmTimer); cmTimer = setTimeout(() => { void playNextCm().catch((error) => console.error('CM selection failed:', error.message)) }, 300) }) } })
-const adminHtml = readFileSync(new URL('../public/admin.html', import.meta.url), 'utf8')
-const broadcastHtml = readFileSync(new URL('../public/broadcast.html', import.meta.url), 'utf8')
-const asset = (name?: string) => (c: any) => c.html(adminHtml)
-let cmGeneration = 0
-let cmTimer: ReturnType<typeof setTimeout> | undefined
-const cmInput = process.env.OBS_CM_SOURCE || 'CM映像'
-let cmActionQueue: Promise<void> = Promise.resolve()
-const enqueueCmAction = <T>(action: () => Promise<T>) => {
-  const result = cmActionQueue.then(action, action)
-  cmActionQueue = result.then(() => undefined, () => undefined)
-  return result
-}
-const stopCmQueue = async () => {
-  cmGeneration += 1
-  if (cmTimer) clearTimeout(cmTimer)
-  cmTimer = undefined
-  await enqueueCmAction(() => obs.stopMedia(cmInput)).catch(() => {})
-}
-const playNextCm = async () => {
-  const generation = cmGeneration
-  const screen = await screenData(db)
-  if (generation !== cmGeneration) return
-  const ad = screen.playlist[0]
-  if (!ad) {
-    await enqueueCmAction(async () => {
-      if (generation === cmGeneration) await obs.stopMedia(cmInput).catch(() => {})
-    })
-    return
-  }
-  const root = resolve(process.env.SIGNAGE_MEDIA_ROOT || resolve(import.meta.dirname, '../../CM'))
-  const media = resolve(root, String(ad.media_path).replace(/[\\/]+/g, sep))
-  if (media !== root && !media.startsWith(root + sep)) throw new Error('CMパスはメディアルート内を指定してください。')
-  if (!existsSync(media)) throw new Error(`CMファイルが見つかりません: ${ad.media_path}`)
-  const started = await enqueueCmAction(async () => {
-    if (generation !== cmGeneration) return false
-    await obs.playMedia(cmInput, media)
-    return generation === cmGeneration
-  })
-  if (!started) return
-  await db.batch([
-    db.prepare('UPDATE commercials SET play_count=play_count+1,last_played_at=CURRENT_TIMESTAMP WHERE id=?').bind(ad.id),
-    db.prepare('INSERT INTO playback_history (commercial_id,break_key) VALUES (?,?)').bind(ad.id, screen.break_key),
-  ])
-  if (generation !== cmGeneration) return
-  cmTimer = setTimeout(() => { void playNextCm().catch((error) => console.error('CM selection failed:', error.message)) }, Math.max(1000, Math.min(ad.duration_seconds * 1000, screen.gap_seconds * 1000)))
-}
-const nowJstMoment = () => {
-  const parts = Object.fromEntries(new Intl.DateTimeFormat('en-GB', {
-    timeZone: 'Asia/Tokyo', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23',
-  }).formatToParts(new Date()).map((part) => [part.type, part.value]))
-  const hour = Number(parts.hour)
-  const minute = Number(parts.minute)
-  return { clock: `${parts.hour}:${parts.minute}`, minutes: hour * 60 + minute, second: Number(parts.second) }
-}
-const padTime = (value: string) => {
-  const match = /^\s*(\d{1,2}):(\d{1,2})\s*$/.exec(value || '')
-  return match ? `${match[1].padStart(2, '0')}:${match[2].padStart(2, '0')}` : ''
-}
-const timeToMinutes = (value: string) => {
-  const time = padTime(value)
-  if (!time) return -1
-  const [hour, minute] = time.split(':').map(Number)
-  return hour * 60 + minute
-}
-const text = (value: unknown, max = 2000) => String(value ?? '').trim().slice(0, max)
-const int = (value: unknown, fallback = 0, min = -2147483648, max = 2147483647) => {
-  const parsed = Number.parseInt(String(value ?? ''), 10)
-  return Number.isFinite(parsed) ? Math.min(max, Math.max(min, parsed)) : fallback
-}
-
-async function requireAdmin(c: any) {
-  const host = c.req.header('host') || ''
-  if (!/^(localhost|127\.0\.0\.1)(:\d+)?$/i.test(host)) return c.json({ error: 'ローカル接続だけ許可されています。' }, 403)
-  return null
-}
-
-function parseCsvLine(line: string): string[] {
-  const values: string[] = []
-  let value = ''
-  let quoted = false
-  for (let i = 0; i < line.length; i += 1) {
-    const char = line[i]
-    if (char === '"' && quoted && line[i + 1] === '"') { value += '"'; i += 1 }
-    else if (char === '"') quoted = !quoted
-    else if (char === ',' && !quoted) { values.push(value.trim()); value = '' }
-    else value += char
-  }
-  values.push(value.trim())
-  return values
-}
-
-function parseCsv(source: string) {
-  const normalized = source.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n')
-  const lines: string[] = []
-  let current = ''
-  let quoted = false
-  for (let index = 0; index < normalized.length; index += 1) {
-    const char = normalized[index]
-    if (char === '"' && quoted && normalized[index + 1] === '"') { current += '""'; index += 1 }
-    else if (char === '"') { quoted = !quoted; current += char }
-    else if (char === '\n' && !quoted) { if (current.trim()) lines.push(current); current = '' }
-    else current += char
-  }
-  if (current.trim()) lines.push(current)
-  if (lines.length < 2) return []
-  const headers = parseCsvLine(lines[0]).map(value => value.toLowerCase().replace(/[\s_\-]/g, ''))
-  return lines.slice(1).map(line => {
-    const cells = parseCsvLine(line)
-    return Object.fromEntries(headers.map((header, index) => [header, cells[index] || '']))
-  })
-}
-
-const csvValue = (row: Record<string, string>, ...keys: string[]) => {
-  for (const key of keys) {
-    const compact = key.toLowerCase().replace(/[\s_\-]/g, '')
-    if (row[compact] !== undefined) return row[compact]
-  }
-  return ''
-}
-
-async function loadPrograms(db: LocalDatabase, day: number, includeDemo = false): Promise<Program[]> {
-  const demoFilter = includeDemo ? '' : ' AND is_demo = 0'
-  const result = await db.prepare(`SELECT * FROM programs WHERE day = ?${demoFilter} ORDER BY COALESCE(NULLIF(adjusted_start, ''), scheduled_start), display_order, id`).bind(day).all<Program>()
-  return result.results || []
-}
-
-async function buildPlaylist(db: LocalDatabase, gapSeconds: number, breakKey: string) {
-  if (gapSeconds <= 0) return []
-  const result = await db.prepare(`
-    SELECT cm.*, COALESCE(cc.preference_score, 0) AS circle_preference,
-           COALESCE(cc.circle_cut_path, '') AS circle_cut_path,
-           COALESCE(cc.name, '') AS circle_name
-    FROM commercials cm LEFT JOIN circle_catalog cc ON cc.slug = cm.circle_slug
-    WHERE cm.is_active = 1 ORDER BY cm.id ASC
-  `).all<any>()
-  const recent = await db.prepare(`
-    SELECT commercial_id, COUNT(*) AS recent_count
-    FROM playback_history WHERE played_at >= datetime('now', '-60 minutes')
-    GROUP BY commercial_id
-  `).all<{ commercial_id: number; recent_count: number }>()
-  const usedInBreak = await db.prepare('SELECT commercial_id FROM playback_history WHERE break_key = ?').bind(breakKey).all<{ commercial_id: number }>()
-  const alreadyUsed = new Set((usedInBreak.results || []).map(item => item.commercial_id))
-  const recentCounts = new Map((recent.results || []).map(item => [item.commercial_id, item.recent_count]))
-  const candidates = (result.results || []).map((ad: any) => ({
-    ...ad,
-    recent_count: recentCounts.get(ad.id) || 0,
-  }))
-  return selectCommercials(candidates, gapSeconds, alreadyUsed)
-}
-
-async function screenData(db: LocalDatabase, previewDemo = false) {
-  const state = await db.prepare('SELECT * FROM signage_state WHERE id = 1').first<any>() || { current_day: 1, wait_cm: 1, delay_minutes: 0, sidebar_mode: 'sync', current_scene_mode: 'program' }
-  const day = int(state.current_day, 1, 1, 7)
-  const loadedPrograms = await loadPrograms(db, day, previewDemo)
-  const programs = previewDemo ? loadedPrograms.filter((program) => Number(program.is_demo) === 1) : loadedPrograms
-  const now = nowJstMoment()
-  const currentMinutes = now.minutes
-  const effectiveStart = (program: Program) => timeToMinutes(program.adjusted_start || program.scheduled_start)
-  let scheduledIndex = -1
-  programs.forEach((program, index) => { if (effectiveStart(program) <= currentMinutes) scheduledIndex = index })
-  let current = scheduledIndex >= 0 ? programs[scheduledIndex] : null
-  let next = programs.find(program => program.kind !== 'break' && effectiveStart(program) > currentMinutes) || null
-  if (previewDemo && programs.length) {
-    scheduledIndex = 0
-    current = programs[0]
-    next = programs.slice(1).find(program => program.kind !== 'break') || null
-  }
-  const breakNow = state.current_scene_mode === 'cm' || current?.kind === 'break' || (!current && !!next)
-  const cmTarget = !previewDemo && state.current_scene_mode === 'cm' && state.cm_target_program_id
-    ? programs.find((program) => Number(program.id) === Number(state.cm_target_program_id)) || null
-    : null
-  const gapEnd = state.current_scene_mode === 'cm' && !previewDemo ? cmTarget : next
-  const gapSeconds = breakNow && gapEnd
-    ? secondsUntilStart(effectiveStart(gapEnd), currentMinutes, now.second)
-    : 0
-  const nextForDisplay = state.current_scene_mode === 'cm' && cmTarget && effectiveStart(cmTarget) <= currentMinutes
-    ? next
-    : gapEnd || next
-  const breakKey = `${day}:${current?.id ?? 'gap'}:${gapEnd?.id ?? 'end'}`
-  const notices = await db.prepare('SELECT * FROM announcements WHERE is_active = 1 ORDER BY is_emergency DESC, display_order ASC, id DESC').all<any>()
-  const previewNotices = previewDemo ? await db.prepare("SELECT * FROM announcements WHERE text LIKE '【デモ】%' ORDER BY id DESC LIMIT 1").all<any>() : { results: [] }
-  const catalog = await db.prepare('SELECT * FROM circle_catalog WHERE is_active = 1 ORDER BY display_order ASC, name ASC').all<any>()
-  const mode = state.sidebar_mode === 'independent' ? 'independent' : 'sync'
-  const playlist = state.wait_cm && breakNow ? await buildPlaylist(db, gapSeconds, breakKey) : []
-  let sidebar: any = null
-  if (mode === 'sync' && playlist.length) sidebar = catalog.results?.find((circle: any) => circle.slug === playlist[0].circle_slug) || null
-  if (mode === 'sync' && !sidebar && current?.circle_slug) sidebar = catalog.results?.find((circle: any) => circle.slug === current.circle_slug) || null
-  if (mode === 'independent' && catalog.results?.length) {
-    const rotationIndex = Math.floor(Date.now() / 12000) % catalog.results.length
-    sidebar = catalog.results[rotationIndex]
-  }
-  const visibleNotices = [
-    ...(notices.results || []),
-    ...(previewNotices.results || []).map((notice: any) => ({ ...notice, is_active: 1 })),
-  ]
-  return { state, day, now: now.clock, current, next: nextForDisplay, current_index: scheduledIndex, gap_seconds: gapSeconds, break_key: breakKey, playlist, notices: visibleNotices, sidebar, sidebar_mode: mode, demo_preview: previewDemo }
-}
-
-app.get('/', asset('admin.html'))
-app.get('/admin', asset('admin.html'))
-app.get('/admin.html', asset('admin.html'))
-app.get('/broadcast', (c) => c.html(broadcastHtml))
-app.get('/broadcast.html', (c) => c.html(broadcastHtml))
-app.get('/api/health', (c) => c.json({ ok: true, storage: 'SQLite', mediaUploads: false, obs: 'local-websocket' }))
-app.get('/api/obs/status', async (c) => c.json(await obs.status()))
-app.get('/api/obs/config', (c) => c.json(obs.connectionSettings()))
-app.get('/api/obs/inputs', async (c) => {
-  try { return c.json({ inputs: await obs.inputs() }) }
-  catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 503) }
+app.get('/', (c) => {
+  return c.text('Shikosai Signage API is running!')
 })
-app.post('/api/obs/config', async (c) => {
-  const denied = await requireAdmin(c); if (denied) return denied
-  const body = await c.req.json<any>()
+
+app.get('/admin', (c) => {
+  return c.html(HTML_ADMIN_PAGE)
+})
+
+const padTimeStr = (t: string) => {
+  if (!t) return '';
+  const p = t.split(':');
+  return p.length === 2 ? ('0' + p[0]).slice(-2) + ':' + ('0' + p[1]).slice(-2) : t;
+};
+
+// ==========================================
+// 0. データベース初期化
+// ==========================================
+app.get('/init', async (c) => {
   try {
-    const password = typeof body.password === 'string' ? body.password : undefined
-    return c.json(await obs.updateConnectionSettings(int(body.port, 4455, 1, 65535), password, Boolean(body.clear_password)))
-  } catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 400) }
-})
-app.get('/api/obs/scenes', async (c) => {
-  try { return c.json({ scenes: await obs.scenes() }) }
-  catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 503) }
-})
-app.post('/api/obs/scene', async (c) => {
-  const denied = await requireAdmin(c); if (denied) return denied
-  const body = await c.req.json<any>()
-  try {
-    const mode = body.mode === 'cm' ? 'cm' : 'program'
-    const previous = await db.prepare('SELECT current_scene_mode,cm_target_program_id FROM signage_state WHERE id=1').first<any>()
-    const targetId = mode === 'cm'
-      ? previous?.current_scene_mode === 'cm'
-        ? previous.cm_target_program_id ?? null
-        : (await screenData(db)).next?.id ?? null
-      : null
-    const result = await obs.switchScene(text(body.scene_name, 120))
-    await db.prepare('UPDATE signage_state SET current_scene_mode=?,cm_target_program_id=?,updated_at=CURRENT_TIMESTAMP WHERE id=1').bind(mode, targetId).run()
-    if (mode === 'cm') {
-      cmGeneration += 1
-      if (cmTimer) clearTimeout(cmTimer)
-      cmTimer = undefined
-      try { await playNextCm() }
-      catch (error) { return c.json({ ...result, target_program_id: targetId, cm_warning: error instanceof Error ? error.message : String(error) }) }
-    } else await stopCmQueue()
-    return c.json({ ...result, target_program_id: targetId })
+    await c.env.DB.batch([
+      c.env.DB.prepare(`
+        CREATE TABLE IF NOT EXISTS badges (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          name TEXT UNIQUE
+        );
+      `),
+      c.env.DB.prepare(`INSERT OR IGNORE INTO badges (name) VALUES ('ステージ'), ('サークルカット'), ('お知らせ'), ('PR企画'), ('ライブ');`)
+    ]);
+
+    try { 
+      await c.env.DB.prepare(`ALTER TABLE timetable ADD COLUMN badge TEXT DEFAULT 'ステージ'`).run(); 
+    } catch(e) {}
+
+    try { 
+      await c.env.DB.prepare(`ALTER TABLE app_state ADD COLUMN delay_minutes INTEGER DEFAULT 0`).run(); 
+    } catch(e) {}
+
+    return c.text('Database initialized successfully');
+  } catch (err: any) {
+    return c.text('Init failed: ' + err.message, 500);
   }
-  catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 400) }
-})
-app.post('/api/obs/text', async (c) => {
-  const denied = await requireAdmin(c); if (denied) return denied
-  const body = await c.req.json<any>()
-  const source = text(body.source, 120); const value = text(body.text, 4000)
-  if (!source) return c.json({ error: 'OBSテキストソース名を入力してください。' }, 400)
-  try { await obs.setText(source, value); return c.json({ success: true }) }
-  catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 400) }
-})
-app.post('/api/obs/publish', async (c) => {
-  const denied = await requireAdmin(c); if (denied) return denied
-  const screen = await screenData(db)
-  const current = screen.current
-  const next = screen.next
-  const configured = [
-    [process.env.OBS_TEXT_SOURCE || 'telop', [current?.title, current?.class_name, current?.description].filter(Boolean).join('\n')],
-    [process.env.OBS_NEXT_SOURCE || '', next ? `${next.adjusted_start || next.scheduled_start}  ${next.title}` : ''],
-    [process.env.OBS_NOTICE_SOURCE || '', screen.notices.filter((notice: any) => notice.is_active).map((notice: any) => notice.text).join('\n')],
-  ] as const
-  try { return c.json(await obs.publishText(Object.fromEntries(configured))) }
-  catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 400) }
+});
+
+// ==========================================
+// 1. バッジ管理 API
+// ==========================================
+app.get('/api/badges', async (c) => {
+  try {
+    const { results } = await c.env.DB.prepare('SELECT * FROM badges ORDER BY id ASC').all()
+    return c.json(results || [])
+  } catch (e: any) {
+    return c.json([{id: 1, name: 'ステージ'}])
+  }
 })
 
-app.get('/api/broadcast-state', async (c) => {
-  const demoPreview = c.req.query('demo') === '1'
-  const screen = await screenData(db, demoPreview)
-  return c.json({ now: screen.now, current: screen.current, next: screen.next, notices: screen.notices, sidebar: screen.sidebar, sidebar_mode: screen.sidebar_mode, mode: screen.state.current_scene_mode, demo_preview: screen.demo_preview })
+app.post('/api/badges', async (c) => {
+  try {
+    const body = await c.req.json()
+    if (!body.name) return c.json({ error: '名前が空です' }, 400)
+    await c.env.DB.prepare('INSERT INTO badges (name) VALUES (?)').bind(body.name).run()
+    return c.json({ success: true })
+  } catch (e: any) {
+    return c.json({ error: e.message }, 500)
+  }
 })
 
+app.post('/api/badges/delete', async (c) => {
+  try {
+    const body = await c.req.json()
+    await c.env.DB.prepare('DELETE FROM badges WHERE id = ?').bind(body.id).run()
+    return c.json({ success: true })
+  } catch (e: any) {
+    return c.json({ error: e.message }, 500)
+  }
+})
+
+// ==========================================
+// 2. 進行コントロール用 API
+// ==========================================
 app.get('/api/state', async (c) => {
-  const screen = await screenData(db)
-  return c.json({ state: screen.state, timetable: await loadPrograms(db, screen.day, true), playback: screen })
+  try {
+    let state: any = null
+    try {
+      state = await c.env.DB.prepare('SELECT * FROM app_state WHERE id = 1').first()
+    } catch (_) {}
+    
+    if (!state) {
+      state = { current_index: -1, is_auto: 0, wait_cm: 0, current_day: 1, delay_minutes: 0 }
+    }
+
+    const currentDay = state.current_day || 1
+    const { results: timetable } = await c.env.DB.prepare(
+      'SELECT * FROM timetable WHERE day = ? ORDER BY start_time ASC, id ASC'
+    ).bind(currentDay).all()
+    
+    return c.json({ state, timetable: timetable || [] })
+  } catch (e: any) {
+    return c.json({ state: { current_index: -1, is_auto: 0, wait_cm: 0, current_day: 1, delay_minutes: 0 }, timetable: [] })
+  }
 })
 
+app.post('/api/state/update', async (c) => {
+  try {
+    const body = await c.req.json()
+    const updates: string[] = []
+    const values: any[] = []
+    
+    if (body.current_day !== undefined) {
+      updates.push('current_day = ?')
+      values.push(body.current_day)
+    }
+    if (body.current_index !== undefined) {
+      updates.push('current_index = ?')
+      values.push(body.current_index)
+    }
+    if (body.is_auto !== undefined) {
+      updates.push('is_auto = ?')
+      values.push(body.is_auto ? 1 : 0)
+    }
+    if (body.wait_cm !== undefined) {
+      updates.push('wait_cm = ?')
+      values.push(body.wait_cm ? 1 : 0)
+    }
+    if (body.delay_minutes !== undefined) {
+      updates.push('delay_minutes = ?')
+      values.push(parseInt(body.delay_minutes) || 0)
+    }
+    
+    if (updates.length > 0) {
+      values.push(1)
+      await c.env.DB.prepare(
+        `UPDATE app_state SET ${updates.join(', ')} WHERE id = ?`
+      ).bind(...values).run()
+    }
+    return c.json({ success: true })
+  } catch (e: any) {
+    return c.json({ error: e.message }, 500)
+  }
+})
+
+// ==========================================
+// 3. タイムテーブル API
+// ==========================================
 app.get('/api/timetable', async (c) => {
-  const day = int(c.req.query('day'), 1, 1, 7)
-  return c.json(await loadPrograms(db, day, true))
-})
-
-app.post('/api/timetable/import', async (c) => {
-  const denied = await requireAdmin(c); if (denied) return denied
-  const body = await c.req.json<any>()
-  const rows = parseCsv(text(body.csv, 1_000_000))
-  const day = int(body.day, 1, 1, 7)
-  const overwrite = Boolean(body.overwrite)
-  if (!rows.length) return c.json({ error: 'CSVにデータ行がありません。' }, 400)
-  const programs = rows.map((row, index) => {
-    const title = text(csvValue(row, 'title', '企画名'), 200)
-    const description = text(csvValue(row, 'description', '説明', '企画説明'), 2000)
-    const scheduled = padTime(csvValue(row, 'scheduled_start', 'start_time', '開始時間', '開始時刻'))
-    const adjusted = padTime(csvValue(row, 'adjusted_start', 'adjusted_start_time', '変更後開始時間', '変更後開始時刻'))
-    const end = padTime(csvValue(row, 'end_time', '終了時間', '終了時刻'))
-    const kind = text(csvValue(row, 'kind', 'type', '区分'), 24).toLowerCase()
-    const className = text(csvValue(row, 'class_name', 'class', 'クラス名'), 80)
-    const circleSlug = text(csvValue(row, 'circle_slug', 'slug', 'サークルslug'), 120)
-    const mediaPath = text(csvValue(row, 'media_path', 'video_path', '映像パス'), 500)
-    const startMinutes = timeToMinutes(adjusted || scheduled)
-    if (!title || startMinutes < 0 || (end && timeToMinutes(end) <= startMinutes)) throw new Error(`${index + 2}行目: 企画名と開始時刻を確認してください。`)
-    return { title, description, scheduled_start: scheduled, adjusted_start: adjusted, end_time: end || adjusted || scheduled, kind: ['break', 'cm', '幕間'].includes(kind) ? 'break' : 'program', class_name: className, circle_slug: circleSlug, media_path: mediaPath, startMinutes }
-  })
-  const sorted = [...programs].sort((a, b) => timeToMinutes(a.adjusted_start || a.scheduled_start) - timeToMinutes(b.adjusted_start || b.scheduled_start))
-  for (let index = 1; index < sorted.length; index += 1) if (sorted[index].startMinutes === sorted[index - 1].startMinutes) return c.json({ error: `開始時刻が重複しています: ${sorted[index - 1].title} / ${sorted[index].title}` }, 400)
-  const current = await loadPrograms(db, day)
-  if (!overwrite && current.length) return c.json({ error: 'この日の企画データがあります。上書きする場合は確認欄を選択してください。' }, 409)
-  const statements: LocalStatement[] = []
-  if (overwrite) statements.push(db.prepare('DELETE FROM programs WHERE day = ?').bind(day))
-  else statements.push(db.prepare('DELETE FROM programs WHERE day = ? AND is_demo = 1').bind(day))
-  for (const [order, item] of sorted.entries()) statements.push(db.prepare(`
-    INSERT INTO programs (day, title, description, scheduled_start, adjusted_start, end_time, kind, class_name, circle_slug, media_path, display_order)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).bind(day, item.title, item.description, item.scheduled_start, item.adjusted_start, item.end_time, item.kind, item.class_name, item.circle_slug, item.media_path, order))
-  await db.batch(statements)
-  return c.json({ success: true, count: sorted.length })
+  try {
+    const { results } = await c.env.DB.prepare('SELECT * FROM timetable ORDER BY day ASC, start_time ASC, id ASC').all()
+    return c.json(results || [])
+  } catch (e: any) {
+    return c.json({ error: e.message }, 500)
+  }
 })
 
 app.post('/api/timetable', async (c) => {
-  const denied = await requireAdmin(c); if (denied) return denied
-  const body = await c.req.json<any>()
-  const day = int(body.day, 1, 1, 7)
-  const start = padTime(text(body.scheduled_start || body.start_time, 10))
-  const adjusted = padTime(text(body.adjusted_start, 10))
-  const end = padTime(text(body.end_time, 10))
-  if (!text(body.title, 200) || timeToMinutes(start) < 0 || (end && timeToMinutes(end) <= timeToMinutes(adjusted || start))) return c.json({ error: '企画名と開始時刻を確認してください。' }, 400)
-  const result = await db.prepare(`INSERT INTO programs (day,title,description,scheduled_start,adjusted_start,end_time,kind,class_name,circle_slug,media_path)
-    VALUES (?,?,?,?,?,?,?,?,?,?)`).bind(day, text(body.title, 200), text(body.description, 2000), start, adjusted, end || adjusted || start, body.kind === 'break' ? 'break' : 'program', text(body.class_name, 80), text(body.circle_slug, 120), text(body.media_path, 500)).run()
-  return c.json({ success: true, id: result.meta.last_row_id })
+  try {
+    const body = await c.req.json()
+    const day = body.day || 1
+    const startTime = padTimeStr(body.start_time || '')
+    const endTime = padTimeStr(body.end_time || '')
+    const type = body.type || 'song'
+    const isSong = (type === 'song' || type === 'ステージ（演奏・企画）')
+    
+    let title = (body.title || '').trim()
+    let band = (body.band || '').trim()
+    if (!isSong && !title) {
+      title = '幕間CM'
+    } else if (isSong && !title && !band) {
+      return c.json({ error: "団体名または企画名を入力してください" }, 400)
+    } else if (!title) {
+      title = band
+    }
+
+    const badge = body.badge || 'ステージ'
+
+    if (!startTime || !endTime) return c.json({ error: "開始時刻と終了時刻を指定してください" }, 400)
+    if (startTime >= endTime) return c.json({ error: "終了時刻は開始時刻より後に設定してください" }, 400)
+
+    const { results: overlaps } = await c.env.DB.prepare(
+      'SELECT title, start_time, end_time FROM timetable WHERE day = ? AND ? < end_time AND ? > start_time'
+    ).bind(day, startTime, endTime).all()
+
+    if (overlaps && overlaps.length > 0) {
+      const conflict: any = overlaps[0]
+      return c.json({ error: `時間が重複しています（既存: ${conflict.start_time}〜${conflict.end_time} 「${conflict.title}」）` }, 400)
+    }
+
+    await c.env.DB.prepare(
+      'INSERT INTO timetable (day, start_time, end_time, title, band, type, badge) VALUES (?, ?, ?, ?, ?, ?, ?)'
+    ).bind(day, startTime, endTime, title, band, type, badge).run()
+
+    return c.json({ success: true })
+  } catch (e: any) {
+    return c.json({ error: e.message }, 500)
+  }
+})
+
+app.post('/api/timetable/batch', async (c) => {
+  try {
+    const body = await c.req.json()
+    const { items, overwrite, day } = body as any
+    const targetDay = day || 1
+
+    if (!items || !Array.isArray(items) || items.length === 0) return c.json({ error: "データがありません" }, 400)
+
+    items.forEach((item: any) => {
+      item.start_time = padTimeStr(item.start_time)
+      item.end_time = padTimeStr(item.end_time)
+      const isSong = (item.type === 'song' || item.type === 'ステージ（演奏・企画）')
+      if (!isSong && !item.title) {
+        item.title = '幕間CM'
+      } else if (!item.title && item.band) {
+        item.title = item.band
+      }
+    })
+
+    const sorted = [...items].sort((a, b) => a.start_time.localeCompare(b.start_time))
+    
+    for (let i = 0; i < sorted.length; i++) {
+      const curr = sorted[i]
+      if (!curr.start_time || !curr.end_time) return c.json({ error: `「${curr.title || '無題'}」の時刻を確認してください` }, 400)
+      if (curr.start_time >= curr.end_time) return c.json({ error: `「${curr.title}」の終了時刻が開始時刻より前です` }, 400)
+      if (i > 0 && curr.start_time < sorted[i - 1].end_time) return c.json({ error: `データ内で時間が重複しています（「${sorted[i-1].title}」と「${curr.title}」）` }, 400)
+    }
+
+    if (!overwrite) {
+      const { results: existing } = await c.env.DB.prepare('SELECT title, start_time, end_time FROM timetable WHERE day = ?').bind(targetDay).all()
+      if (existing && existing.length > 0) {
+        for (const item of items) {
+          for (const ex of existing as any[]) {
+            if (item.start_time < padTimeStr(ex.end_time as string) && item.end_time > padTimeStr(ex.start_time as string)) {
+              return c.json({ error: `既存の「${ex.title}」(${ex.start_time}〜${ex.end_time}) と重複しています` }, 400)
+            }
+          }
+        }
+      }
+    }
+
+    const stmts = []
+    if (overwrite) stmts.push(c.env.DB.prepare('DELETE FROM timetable WHERE day = ?').bind(targetDay))
+    
+    for (const item of sorted) {
+      stmts.push(c.env.DB.prepare('INSERT INTO timetable (day, start_time, end_time, title, band, type, badge) VALUES (?, ?, ?, ?, ?, ?, ?)')
+        .bind(targetDay, item.start_time, item.end_time, item.title || '無題', item.band || '', item.type || 'song', item.badge || 'ステージ'))
+    }
+
+    await c.env.DB.batch(stmts)
+    return c.json({ success: true, count: sorted.length })
+  } catch (e: any) {
+    return c.json({ error: e.message }, 500)
+  }
 })
 
 app.post('/api/timetable/update', async (c) => {
-  const denied = await requireAdmin(c); if (denied) return denied
-  const body = await c.req.json<any>()
-  const id = int(body.id, 0, 1)
-  const existing = await db.prepare('SELECT * FROM programs WHERE id=?').bind(id).first<Program>()
-  if (!existing) return c.json({ error: '企画が見つかりません。' }, 404)
-  const title = text(body.title, 200)
-  const scheduledStart = padTime(body.scheduled_start || body.start_time)
-  const adjustedStart = padTime(body.adjusted_start)
-  const endTime = padTime(body.end_time) || adjustedStart || scheduledStart
-  if (!title || timeToMinutes(scheduledStart) < 0 || (endTime && timeToMinutes(endTime) <= timeToMinutes(adjustedStart || scheduledStart))) {
-    return c.json({ error: '企画名と開始・終了時間を確認してください。' }, 400)
+  try {
+    const body = await c.req.json()
+    const { id, day, band, type, badge } = body
+    let title = (body.title || '').trim()
+    const isSong = (type === 'song' || type === 'ステージ（演奏・企画）')
+    if (!isSong && !title) {
+      title = '幕間CM'
+    } else if (!title && band) {
+      title = band
+    }
+
+    const start_time = padTimeStr(body.start_time)
+    const end_time = padTimeStr(body.end_time)
+    const targetDay = day || 1
+
+    if (!start_time || !end_time) return c.json({ error: "時刻を指定してください" }, 400)
+    if (start_time >= end_time) return c.json({ error: "終了時刻は開始時刻より後に設定してください" }, 400)
+
+    const { results: overlaps } = await c.env.DB.prepare(
+      'SELECT title, start_time, end_time FROM timetable WHERE day = ? AND ? < end_time AND ? > start_time AND id != ?'
+    ).bind(targetDay, start_time, end_time, id).all()
+
+    if (overlaps && overlaps.length > 0) {
+      const conflict: any = overlaps[0]
+      return c.json({ error: `時間が重複しています（既存: ${conflict.start_time}〜${conflict.end_time} 「${conflict.title}」）` }, 400)
+    }
+
+    await c.env.DB.prepare('UPDATE timetable SET day = ?, start_time = ?, end_time = ?, title = ?, band = ?, type = ?, badge = ? WHERE id = ?')
+      .bind(targetDay, start_time, end_time, title, band, type, badge || 'ステージ', id).run()
+    return c.json({ success: true })
+  } catch (e: any) {
+    return c.json({ error: e.message }, 500)
   }
-  const isDemo = body.is_demo === undefined ? null : body.is_demo ? 1 : 0
-  await db.prepare(`UPDATE programs SET title=?,description=?,scheduled_start=?,adjusted_start=?,end_time=?,kind=?,class_name=?,circle_slug=?,media_path=?,is_demo=COALESCE(?,is_demo) WHERE id=?`)
-    .bind(title, text(body.description, 2000), scheduledStart, adjustedStart, endTime, body.kind === 'break' ? 'break' : 'program', text(body.class_name, 80), text(body.circle_slug, 120), text(body.media_path, 500), isDemo, id).run()
-  return c.json({ success: true })
 })
 
 app.post('/api/timetable/delete', async (c) => {
-  const denied = await requireAdmin(c); if (denied) return denied
-  const body = await c.req.json<any>(); await db.prepare('DELETE FROM programs WHERE id=?').bind(int(body.id)).run(); return c.json({ success: true })
-})
-
-app.get('/api/catalog', async (c) => {
-  const result = await db.prepare('SELECT * FROM circle_catalog WHERE is_active=1 ORDER BY display_order,name').all()
-  return c.json(result.results || [])
-})
-
-app.post('/api/catalog/sync', async (c) => {
-  const denied = await requireAdmin(c); if (denied) return denied
-  const body = await c.req.json<any>()
-  const records = (Array.isArray(body.records) ? body.records : []).slice(0, 300) as CatalogRecord[]
-  if (!records.length) return c.json({ error: 'カタログデータがありません。' }, 400)
-  const statements = records.filter(item => item.slug && item.name).map((item, index) => db.prepare(`
-    INSERT INTO circle_catalog (slug,name,kind,class_name,group_name,description,program_description,circle_cut_path,circle_cut_alt,source_url,display_order)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?)
-    ON CONFLICT(slug) DO UPDATE SET name=excluded.name,kind=excluded.kind,class_name=excluded.class_name,group_name=excluded.group_name,
-      description=excluded.description,program_description=excluded.program_description,circle_cut_path=excluded.circle_cut_path,circle_cut_alt=excluded.circle_cut_alt,source_url=excluded.source_url,display_order=excluded.display_order,updated_at=CURRENT_TIMESTAMP
-  `).bind(text(item.slug, 120), text(item.name, 200), item.kind === 'class' ? 'class' : 'circle', text(item.class_name, 80), text(item.group_name, 80), text(item.description, 1600), text(item.program_description, 2400), text(item.circle_cut_path, 800), text(item.circle_cut_alt, 500), text(item.source_url, 800), index))
-  for (let index = 0; index < statements.length; index += 80) await db.batch(statements.slice(index, index + 80))
-  return c.json({ success: true, count: statements.length })
-})
-
-app.post('/api/catalog/update', async (c) => {
-  const denied = await requireAdmin(c); if (denied) return denied
-  const body = await c.req.json<any>()
-  await db.prepare(`UPDATE circle_catalog SET preference_score=?,display_order=?,is_active=? WHERE slug=?`)
-    .bind(int(body.preference_score, 0, -10, 10), int(body.display_order, 0, 0, 9999), body.is_active ? 1 : 0, text(body.slug, 120)).run()
+  const body = await c.req.json()
+  await c.env.DB.prepare('DELETE FROM timetable WHERE id = ?').bind(body.id).run()
   return c.json({ success: true })
 })
 
-app.get('/api/commercials', async (c) => {
-  const result = await db.prepare(`SELECT cm.*, cc.name AS circle_name FROM commercials cm LEFT JOIN circle_catalog cc ON cc.slug=cm.circle_slug ORDER BY cm.is_active DESC, cm.id DESC`).all()
-  return c.json(result.results || [])
-})
+app.post('/api/timetable/delete_range', async (c) => {
+  try {
+    const body = await c.req.json()
+    const targetDay = body.day || 1
+    const start_time = padTimeStr(body.start_time)
+    const end_time = padTimeStr(body.end_time)
 
-app.post('/api/commercials', async (c) => {
-  const denied = await requireAdmin(c); if (denied) return denied
-  const body = await c.req.json<any>()
-  const title = text(body.title, 200); const mediaPath = text(body.media_path, 500)
-  if (!title || !mediaPath || /^(data:|https?:\/\/)/i.test(mediaPath)) return c.json({ error: 'CM名とPC上の相対パスを入力してください。アップロードやURL登録はできません。' }, 400)
-  const result = await db.prepare(`INSERT INTO commercials (title,circle_slug,media_path,duration_seconds,preference_score,max_per_break,is_active)
-    VALUES (?,?,?,?,?,?,?)`).bind(title,text(body.circle_slug,120),mediaPath,int(body.duration_seconds,15,1,3600),int(body.preference_score,0,-10,10),int(body.max_per_break,1,1,20),body.is_active===false?0:1).run()
-  return c.json({ success: true, id: result.meta.last_row_id })
-})
+    if (!start_time || !end_time) return c.json({ error: "時刻を指定してください" }, 400)
+    if (start_time >= end_time) return c.json({ error: "終了時刻は開始時刻より後に設定してください" }, 400)
 
-app.post('/api/commercials/update', async (c) => {
-  const denied = await requireAdmin(c); if (denied) return denied
-  const body = await c.req.json<any>()
-  const mediaPath = text(body.media_path, 500)
-  if (/^(data:|https?:\/\/)/i.test(mediaPath)) return c.json({ error: 'ローカルPCの相対パスを登録してください。' }, 400)
-  await db.prepare(`UPDATE commercials SET title=?,circle_slug=?,media_path=?,duration_seconds=?,preference_score=?,max_per_break=?,is_active=? WHERE id=?`)
-    .bind(text(body.title,200),text(body.circle_slug,120),mediaPath,int(body.duration_seconds,15,1,3600),int(body.preference_score,0,-10,10),int(body.max_per_break,1,1,20),body.is_active?1:0,int(body.id)).run()
-  return c.json({ success: true })
-})
+    const { results } = await c.env.DB.prepare('SELECT id, start_time, end_time FROM timetable WHERE day = ?').bind(targetDay).all()
+    if (!results || results.length === 0) return c.json({ success: true })
 
-app.post('/api/commercials/delete', async (c) => {
-  const denied = await requireAdmin(c); if (denied) return denied
-  const body = await c.req.json<any>(); await db.prepare('DELETE FROM commercials WHERE id=?').bind(int(body.id)).run(); return c.json({ success: true })
-})
+    const idsToDelete = results.filter((row: any) => {
+      const s = padTimeStr(row.start_time)
+      const e = padTimeStr(row.end_time)
+      return s >= start_time && e <= end_time
+    }).map((row: any) => row.id)
 
-app.post('/api/commercials/:id/play', async (c) => {
-  const denied = await requireAdmin(c); if (denied) return denied
-  const id = int(c.req.param('id'))
-  const breakKey = text(c.req.query('break') || '', 120)
-  await db.batch([
-    db.prepare('UPDATE commercials SET play_count=play_count+1,last_played_at=CURRENT_TIMESTAMP WHERE id=?').bind(id),
-    db.prepare('INSERT INTO playback_history (commercial_id,break_key) VALUES (?,?)').bind(id, breakKey),
-  ])
-  return c.json({ success: true })
-})
-
-app.get('/api/announcements', async (c) => {
-  const result = await db.prepare('SELECT * FROM announcements ORDER BY is_active DESC,is_emergency DESC,display_order ASC,id DESC').all()
-  return c.json(result.results || [])
-})
-
-app.post('/api/announcements', async (c) => {
-  const denied = await requireAdmin(c); if (denied) return denied
-  const body = await c.req.json<any>(); const message = text(body.text, 1600)
-  if (!message) return c.json({ error: 'お知らせ文を入力してください。' }, 400)
-  const result = await db.prepare('INSERT INTO announcements (text,category,is_emergency,is_active) VALUES (?,?,?,?)')
-    .bind(message,text(body.category || 'お知らせ',50),body.is_emergency?1:0,body.is_active===false?0:1).run()
-  return c.json({ success: true, id: result.meta.last_row_id })
-})
-
-app.post('/api/announcements/update', async (c) => {
-  const denied = await requireAdmin(c); if (denied) return denied
-  const body = await c.req.json<any>()
-  await db.prepare('UPDATE announcements SET text=?,category=?,is_emergency=?,is_active=?,updated_at=CURRENT_TIMESTAMP WHERE id=?')
-    .bind(text(body.text,1600),text(body.category || 'お知らせ',50),body.is_emergency?1:0,body.is_active?1:0,int(body.id)).run()
-  return c.json({ success: true })
-})
-
-app.post('/api/announcements/delete', async (c) => {
-  const denied = await requireAdmin(c); if (denied) return denied
-  const body = await c.req.json<any>(); await db.prepare('DELETE FROM announcements WHERE id=?').bind(int(body.id)).run(); return c.json({ success: true })
-})
-
-app.get('/api/settings', async (c) => c.json(await db.prepare('SELECT * FROM signage_state WHERE id=1').first() || {}))
-app.post('/api/settings', async (c) => {
-  const denied = await requireAdmin(c); if (denied) return denied
-  const body = await c.req.json<any>()
-  const updates: string[] = []
-  const values: unknown[] = []
-  const fields: Record<string, unknown> = {
-    current_day: body.current_day === undefined ? undefined : int(body.current_day, 1, 1, 7),
-    sidebar_mode: body.sidebar_mode === undefined ? undefined : (body.sidebar_mode === 'independent' ? 'independent' : 'sync'),
-    wait_cm: body.wait_cm === undefined ? undefined : (body.wait_cm ? 1 : 0),
-    delay_minutes: body.delay_minutes === undefined ? undefined : int(body.delay_minutes, 0, -180, 720),
+    if (idsToDelete.length > 0) {
+      const placeholders = idsToDelete.map(() => '?').join(',')
+      await c.env.DB.prepare(`DELETE FROM timetable WHERE id IN (${placeholders})`).bind(...idsToDelete).run()
+    }
+    return c.json({ success: true, count: idsToDelete.length })
+  } catch (e: any) {
+    return c.json({ error: e.message }, 500)
   }
-  for (const [key, value] of Object.entries(fields)) if (value !== undefined) { updates.push(`${key}=?`); values.push(value) }
-  if (updates.length) await db.prepare(`UPDATE signage_state SET ${updates.join(',')},updated_at=CURRENT_TIMESTAMP WHERE id=1`).bind(...values).run()
-  return c.json({ success: true })
 })
 
-app.get('/api/playback', async (c) => {
-  const denied = await requireAdmin(c); if (denied) return denied
-  return c.json(await screenData(db))
-})
+// ==========================================
+// 4. 管理画面 HTML
+// ==========================================
+const HTML_ADMIN_PAGE = `<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>茨香祭 進行送出コンソール</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #f8fafc; margin: 0; padding: 16px; }
+    .container { max-width: 860px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; }
+    
+    .tab-nav { display: flex; gap: 8px; border-bottom: 2px solid #334155; padding-bottom: 8px; }
+    .tab-btn { flex: 1; padding: 12px; font-size: 15px; font-weight: bold; background: #1e293b; color: #94a3b8; border: none; border-radius: 8px; cursor: pointer; transition: 0.2s; text-align: center; }
+    .tab-btn.active { background: #0284c7; color: white; }
 
+    .card { background: #1e293b; padding: 16px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
+    h2, h3 { margin-top: 0; margin-bottom: 12px; font-size: 18px; }
+    textarea, input[type="text"], input[type="time"], input[type="number"], select {
+      width: 100%; padding: 10px; background: #0f172a; border: 1px solid #334155; color: #f8fafc; border-radius: 6px; font-size: 15px;
+    }
+    textarea { height: 75px; resize: vertical; }
+    .form-group { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; }
+    .form-row { display: flex; gap: 10px; margin-top: 10px; flex-wrap: wrap; align-items: center; }
 
-app.post('/api/backups', async (c) => {
-  const denied = await requireAdmin(c); if (denied) return denied
-  const tables = ['signage_state','programs','circle_catalog','commercials','announcements']
-  const snapshot: Record<string, unknown> = { created_at: new Date().toISOString(), media_policy: 'Local paths and text only; no media bytes.' }
-  for (const table of tables) snapshot[table] = (await db.prepare(`SELECT * FROM ${table}`).all()).results
-  const body = JSON.stringify(snapshot, null, 2)
-  const directory = resolve(process.env.SIGNAGE_BACKUP_DIR || './data/backups')
-  mkdirSync(directory, { recursive: true })
-  const filename = resolve(directory, `snapshot-${new Date().toISOString().replace(/[:.]/g, '-')}.json`)
-  writeFileSync(filename, body, 'utf8')
-  await db.prepare('INSERT INTO backup_log (local_path,byte_size) VALUES (?,?)').bind(filename, Buffer.byteLength(body)).run()
-  return c.json({ success: true, key: filename, byte_size: Buffer.byteLength(body) })
-})
-app.get('/api/backups', async (c) => c.json((await db.prepare('SELECT id,local_path,created_at,byte_size FROM backup_log ORDER BY id DESC LIMIT 10').all()).results))
+    .btn { background: #2563eb; color: white; border: none; padding: 10px 16px; border-radius: 6px; cursor: pointer; font-weight: bold; transition: 0.2s; font-size: 14px; }
+    .btn:hover { background: #1d4ed8; }
+    .btn-secondary { background: #475569; padding: 6px 12px; font-size: 13px; }
+    .btn-secondary:hover { background: #64748b; }
+    .btn-danger { background: #dc2626; padding: 6px 12px; font-size: 12px; }
+    .btn-save { background: #059669; padding: 6px 12px; font-size: 12px; }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
-return app
-}
+    .list-container { display: flex; flex-direction: column; gap: 12px; margin-top: 10px; }
+    .item-card { background: #1e293b; border-radius: 8px; padding: 14px; border-left: 5px solid #64748b; }
+    .item-song { border-left-color: #10b981; }
+    .item-break { border-left-color: #f59e0b; }
+    .item-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; flex-wrap: wrap; gap: 8px; }
+
+    #toast { position: fixed; bottom: 24px; right: 24px; background: #059669; color: white; padding: 12px 24px; border-radius: 8px; font-weight: bold; box-shadow: 0 8px 16px rgba(0,0,0,0.4); transform: translateY(100px); opacity: 0; transition: all 0.3s ease; z-index: 2000; }
+    #toast.show { transform: translateY(0); opacity: 1; }
+
+    .modal-overlay { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.75); display: none; align-items: center; justify-content: center; z-index: 1500; padding: 16px; }
+    .modal-overlay.active { display: flex; }
+    .modal-card { background: #1e293b; border: 1px solid #334155; border-radius: 12px; width: 100%; max-width: 820px; max-height: 90vh; display: flex; flex-direction: column; box-shadow: 0 20px 40px rgba(0,0,0,0.6); overflow: hidden; }
+    .modal-header { padding: 16px 20px; border-bottom: 1px solid #334155; display: flex; justify-content: space-between; align-items: center; }
+    .modal-body { padding: 20px; overflow-y: auto; flex: 1; }
+    .modal-footer { padding: 14px 20px; border-top: 1px solid #334155; display: flex; justify-content: space-between; align-items: center; background: #162032; }
+    
+    .guide-box { background: rgba(56, 189, 248, 0.1); border-left: 4px solid #38bdf8; padding: 10px 14px; border-radius: 4px; font-size: 13px; color: #bae6fd; margin-bottom: 14px; line-height: 1.5; }
+    
+    .import-table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 13px; }
+    .import-table th { background: #0f172a; text-align: left; padding: 8px 10px; color: #94a3b8; border: 1px solid #334155; }
+    .import-table td { padding: 8px 10px; border: 1px solid #334155; }
+    .import-table tr.has-error { background: rgba(239, 68, 68, 0.15); }
+    .import-table tr.has-error td { border-color: #ef4444; }
+
+    /* 手動進行コントロール特化カード */
+    .control-slot { padding: 14px; border-radius: 10px; margin-bottom: 12px; }
+    .control-slot-prev { background: #0f172a; border-left: 4px solid #64748b; opacity: 0.75; }
+    .control-slot-current { background: #0284c7; border-left: 6px solid #38bdf8; padding: 20px; box-shadow: 0 4px 14px rgba(2, 132, 199, 0.4); }
+    .control-slot-next { background: #0f172a; border-left: 4px solid #3b82f6; }
+    .c-title { font-size: 20px; font-weight: bold; margin: 4px 0; word-break: break-all; }
+    .c-sub { font-size: 14px; color: #e2e8f0; word-break: break-all; }
+    .setting-box { background: #0f172a; border: 1px solid #334155; padding: 14px; border-radius: 10px; display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; gap: 10px; }
+    
+    .main-control-btn-group { display: flex; gap: 12px; margin: 16px 0; }
+    .btn-step-prev { flex: 1; background: #475569; padding: 18px; font-size: 18px; border-radius: 10px; }
+    .btn-step-prev:hover { background: #64748b; }
+    .btn-step-next { flex: 2; background: #059669; padding: 18px; font-size: 20px; border-radius: 10px; }
+    .btn-step-next:hover { background: #10b981; }
+
+    .ctrl-item-card { background: #0f172a; padding: 12px; border-radius: 8px; margin-bottom: 8px; border-left: 4px solid #64748b; font-size: 14px; display: flex; flex-direction: column; gap: 4px; cursor: pointer; transition: 0.15s; }
+    .ctrl-item-card:hover { background: #1e293b; }
+    .ctrl-item-card.active { background: #0369a1; border-left-color: #38bdf8; }
+    .ctrl-item-row { display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .ctrl-time { font-weight: bold; color: #38bdf8; font-size: 13px; }
+    .ctrl-title { font-weight: bold; font-size: 15px; color: #fff; word-break: break-all; }
+    .ctrl-band { color: #94a3b8; font-size: 13px; word-break: break-all; }
+    
+    .delay-input-row { display: flex; align-items: center; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+    .delay-input { width: 90px !important; padding: 6px 10px !important; font-size: 16px !important; text-align: center; }
+    .delay-btn-group { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+    .delay-btn { background: #334155; color: white; border: none; padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 13px; font-weight: bold; }
+    .delay-btn:hover { background: #475569; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 12px;">
+      <h1 style="margin:0; font-size:22px; color:#f8fafc;">茨香祭 進行送出コンソール</h1>
+      <div id="globalDelayBadge" style="display:none; background:#ea580c; color:white; padding:6px 14px; border-radius:20px; font-weight:bold; font-size:14px; box-shadow:0 0 10px rgba(234,88,12,0.4);">＋0分 遅延中</div>
+    </div>
+
+    <div class="tab-nav">
+      <button class="tab-btn active" id="tabBtnControl" onclick="switchTab('control')">🎮 手動進行コントロール</button>
+      <button class="tab-btn" id="tabBtnTimetable" onclick="switchTab('timetable')">📅 タイムテーブル管理</button>
+    </div>
+
+    <!-- タブ: 手動進行コントロール -->
+    <div id="tabContentControl">
+      <div class="card">
+        <h2 style="margin-bottom: 16px;">🎮 手動送出ステータス</h2>
+
+        <div class="control-slot control-slot-prev">
+          <div style="font-size:12px; color:#94a3b8; font-weight:bold;">◀ 1つ前の演目</div>
+          <div id="ctrl-prev-title" class="c-title">なし</div>
+        </div>
+
+        <div class="control-slot control-slot-current">
+          <div style="font-size:12px; color:#e0f2fe; font-weight:bold;">● 現在OBSで送出中</div>
+          <div id="ctrl-curr-title" class="c-title">待機中</div>
+          <div id="ctrl-curr-sub" class="c-sub"></div>
+        </div>
+
+        <!-- メイン送出切り替えボタン -->
+        <div class="main-control-btn-group">
+          <button class="btn btn-step-prev" onclick="manualChange(-1)">◀ 前へ戻す</button>
+          <button class="btn btn-step-next" onclick="manualChange(1)">次へ送出 ▶</button>
+        </div>
+
+        <div class="control-slot control-slot-next">
+          <div style="font-size:12px; color:#94a3b8; font-weight:bold;">▶ 次の演目（次に送出されるもの）</div>
+          <div id="ctrl-next-title" class="c-title">なし</div>
+        </div>
+
+        <div class="setting-box" style="margin-top: 16px; background: rgba(3, 105, 161, 0.4); border-color: #0284c7;">
+          <div>
+            <div style="font-weight:bold; font-size:14px; margin-bottom:2px; color:#e0f2fe;">🗓️ 送出日程の選択</div>
+            <div style="font-size:11px; color:#bae6fd;">現在連動させる日程</div>
+          </div>
+          <div style="display:flex; gap:8px;">
+            <button id="btnCtrlDay1" class="btn" style="padding:8px 16px; border-radius:8px;" onclick="changeCurrentDay(1)">1日目</button>
+            <button id="btnCtrlDay2" class="btn btn-secondary" style="padding:8px 16px; border-radius:8px;" onclick="changeCurrentDay(2)">2日目</button>
+          </div>
+        </div>
+
+        <div class="setting-box" style="flex-direction: column; align-items: flex-start;">
+          <div style="display:flex; justify-content:space-between; width:100%; align-items:center;">
+            <div>
+              <div style="font-weight:bold; font-size:14px; margin-bottom:2px; color:#fed7aa;">⏱️ 全体遅延オフセット</div>
+              <div style="font-size:11px; color:#94a3b8;">OBS上の演目帯に赤線＋変更後時刻を反映します</div>
+            </div>
+            <div style="font-weight:bold; font-size:16px; color:#ea580c;" id="currentDelayLabel">遅延なし (0分)</div>
+          </div>
+          
+          <div class="delay-input-row">
+            <span style="font-size:13px; color:#94a3b8;">自由指定:</span>
+            <!-- ★ 自動反映用の oninput イベント -->
+            <input type="number" id="customDelayInput" class="delay-input" min="0" max="180" placeholder="0" value="0" oninput="autoSaveDelay()">
+            <span style="font-size:14px;">分</span>
+            <button class="btn" style="padding:6px 14px; font-size:13px;" onclick="submitCustomDelay()">手動適用</button>
+            <button class="btn btn-danger" style="padding:6px 12px; font-size:13px;" onclick="setDelay(0)">解除(0分)</button>
+          </div>
+
+          <div style="font-size:12px; color:#94a3b8; margin-top:8px;">ワンタップ指定:</div>
+          <div class="delay-btn-group">
+            <button class="delay-btn" onclick="setDelay(5)">+5分</button>
+            <button class="delay-btn" onclick="setDelay(10)">+10分</button>
+            <button class="delay-btn" onclick="setDelay(15)">+15分</button>
+            <button class="delay-btn" onclick="setDelay(20)">+20分</button>
+            <button class="delay-btn" onclick="setDelay(30)">+30分</button>
+            <button class="delay-btn" onclick="setDelay(45)">+45分</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:16px;">
+        <h3>📋 演目一覧（クリックして直接ジャンプ送出も可能）</h3>
+        <div id="ctrl-timetable-list" class="list-container" style="max-height: 380px; overflow-y:auto; gap:6px;"></div>
+      </div>
+    </div>
+
+    <!-- タブ: タイムテーブル管理 -->
+    <div id="tabContentTimetable" style="display:none;">
+      <div style="display:flex; gap:8px; margin-bottom:12px;">
+        <button id="btnEditDay1" class="btn" style="flex:1; border-radius:8px;" onclick="setEditDay(1)">📅 1日目</button>
+        <button id="btnEditDay2" class="btn btn-secondary" style="flex:1; border-radius:8px;" onclick="setEditDay(2)">📅 2日目</button>
+      </div>
+
+      <div class="card">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; flex-wrap:wrap; gap:8px;">
+          <h2 style="margin:0;">📅 新規登録 (<span id="txtEditDayLabel">1日目</span>)</h2>
+          <div style="display:flex; gap:6px;">
+            <button class="btn btn-secondary" style="padding:6px 10px;" onclick="openBadgeModal()">🏷️ バッジ管理</button>
+            <button class="btn btn-secondary" style="background:#b91c1c; padding:6px 10px;" onclick="openDeleteRangeModal()">🗑️ 範囲削除</button>
+            <button class="btn btn-secondary" style="padding:6px 10px;" onclick="openImportModal()">📋 一括インポート</button>
+          </div>
+        </div>
+        <div class="form-row">
+          <div style="flex:1; min-width:110px;">
+            <label style="font-size:12px; color:#94a3b8;">開始時刻</label>
+            <input type="time" id="ttStart" value="10:00">
+          </div>
+          <div style="flex:1; min-width:110px;">
+            <label style="font-size:12px; color:#94a3b8;">終了時刻</label>
+            <input type="time" id="ttEnd" value="10:30">
+          </div>
+          <div style="flex:1; min-width:130px;">
+            <label style="font-size:12px; color:#94a3b8;">種別</label>
+            <select id="ttType" onchange="toggleNewBadgeSelect()">
+              <option value="song">ステージ（演奏・企画）</option>
+              <option value="break">幕間（準備・CM放映）</option>
+            </select>
+          </div>
+          <div style="flex:1; min-width:130px;" id="newBadgeGroup">
+            <label style="font-size:12px; color:#94a3b8;">バッジ</label>
+            <select id="ttBadge"></select>
+          </div>
+        </div>
+        <div class="form-row" style="margin-top:12px;">
+          <div style="flex:1; min-width:130px;">
+            <label style="font-size:12px; color:#94a3b8;">団体名 (幕間・詳細あり時は省略可)</label>
+            <input type="text" id="ttBand" placeholder="例: 吹奏楽部">
+          </div>
+          <div style="flex:2; min-width:160px;">
+            <label style="font-size:12px; color:#94a3b8;">詳細・タイトル (省略可)</label>
+            <input type="text" id="ttTitle" placeholder="例: オープニング演奏">
+          </div>
+        </div>
+        <button class="btn" style="margin-top:14px; width:100%;" onclick="submitTimetable()">タイムテーブルに追加</button>
+      </div>
+
+      <div class="card" style="margin-top:16px;">
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+          <h3 style="margin:0;">📋 登録済み一覧 (<span id="txtListDayLabel">1日目</span>)</h3>
+          <button class="btn" style="padding:6px 12px; font-size:12px; background:#334155;" onclick="loadTimetableList()">↻ 更新</button>
+        </div>
+        <div id="timetableList" class="list-container" style="margin-top:12px;">読み込み中...</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- モーダル: バッジ管理 -->
+  <div class="modal-overlay" id="badgeModal">
+    <div class="modal-card" style="max-width: 500px;">
+      <div class="modal-header">
+        <h3 style="margin:0;">🏷️ 表示バッジの管理</h3>
+        <button style="background:transparent; border:none; color:#94a3b8; font-size:24px; cursor:pointer;" onclick="closeBadgeModal()">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p style="font-size:13px; color:#94a3b8; margin-top:0;">タイムテーブルやOBS画面に表示する「バッジ」の種類を追加・削除できます。</p>
+        <div style="display:flex; gap:10px; margin-bottom:16px;">
+          <input type="text" id="newBadgeName" placeholder="新しいバッジ名 (例: 吹奏楽部)" style="flex:1;">
+          <button class="btn" onclick="addBadge()">追加</button>
+        </div>
+        <div id="badgeList" class="list-container">読み込み中...</div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" style="margin-left:auto;" onclick="closeBadgeModal()">閉じる</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- モーダル: 範囲削除 -->
+  <div class="modal-overlay" id="deleteRangeModal">
+    <div class="modal-card" style="max-width: 450px;">
+      <div class="modal-header">
+        <h3 style="margin:0;">🗑️ 指定範囲の削除 (<span id="lblDelModalDay">1日目</span>)</h3>
+        <button style="background:transparent; border:none; color:#94a3b8; font-size:24px; cursor:pointer;" onclick="closeDeleteRangeModal()">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="guide-box" style="background: rgba(239, 68, 68, 0.1); border-left-color: #ef4444; color: #fca5a5;">
+          指定した時間帯に<strong>完全に収まる</strong>演目を一括で削除します。
+        </div>
+        <div class="form-row">
+          <div style="flex:1;"><label style="font-size:12px; color:#94a3b8;">開始時刻</label><input type="time" id="delStartTime" value="00:00"></div>
+          <div style="flex:1;"><label style="font-size:12px; color:#94a3b8;">終了時刻</label><input type="time" id="delEndTime" value="23:59"></div>
+        </div>
+      </div>
+      <div class="modal-footer"><button class="btn btn-secondary" onclick="closeDeleteRangeModal()">キャンセル</button><button class="btn btn-danger" onclick="executeDeleteRange()">一括削除する</button></div>
+    </div>
+  </div>
+
+  <!-- モーダル: 一括インポート -->
+  <div class="modal-overlay" id="importModal">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3 style="margin:0;">📋 一括インポート (<span id="lblImpModalDay">1日目</span>)</h3>
+        <button style="background:transparent; border:none; color:#94a3b8; font-size:24px; cursor:pointer;" onclick="closeImportModal()">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="guide-box">
+          💡 <strong>Excel / Googleスプレッドシートからそのままコピー＆貼り付けできます</strong><br>
+          列の順番 (6列): <code>[開始時刻]   [終了時刻]   [団体名]   [詳細(企画名)]   [種別(ステージ/幕間)]   [バッジ]</code><br>
+        </div>
+        <div class="form-group">
+          <label style="font-size:12px; color:#94a3b8;">貼り付けエリア</label>
+          <textarea id="importRawText" style="height:120px;" oninput="parseImportText()" placeholder="10:00	10:30	吹奏楽部	オープニング演奏	ステージ	ライブ"></textarea>
+        </div>
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-top:14px;">
+          <span style="font-size:13px; font-weight:bold;" id="importStats">解析結果: 0 件</span>
+          <label style="display:flex; align-items:center; gap:6px; font-size:13px; cursor:pointer;">
+            <input type="checkbox" id="importOverwrite"> 既存のタイムテーブルを全消去して上書きする
+          </label>
+        </div>
+        <table class="import-table">
+          <thead>
+            <tr>
+              <th style="width:65px;">開始</th>
+              <th style="width:65px;">終了</th>
+              <th>団体名</th>
+              <th>詳細</th>
+              <th style="width:60px;">種別</th>
+              <th style="width:70px;">バッジ</th>
+              <th style="width:90px;">状態</th>
+            </tr>
+          </thead>
+          <tbody id="importPreviewBody">
+            <tr><td colspan="7" style="text-align:center; color:#64748b; padding:16px;">ここにリアルタイムプレビューが表示されます</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" onclick="closeImportModal()">キャンセル</button>
+        <button class="btn" id="btnExecuteImport" onclick="executeBatchImport()" disabled>インポートする</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast">✅ 完了しました！</div>
+
+  <script>
+    var API_BASE = window.location.origin;
+    var parsedBatchItems = [];
+    var gState = { current_index: -1, is_auto: 0, wait_cm: 0, current_day: 1, delay_minutes: 0 };
+    var gTimetable = [];
+    var gAllTimetable = [];
+    var currentEditDay = 1;
+    var gBadges = [];
+    
+    var delayInputTimer = null;
+
+    function addMinutes(timeStr, minutesToAdd) {
+      if (!timeStr || minutesToAdd === 0) return timeStr;
+      var parts = timeStr.split(':');
+      var h = parseInt(parts[0], 10);
+      var m = parseInt(parts[1], 10) + minutesToAdd;
+      h += Math.floor(m / 60);
+      m = m % 60;
+      return ('0' + h).slice(-2) + ':' + ('0' + m).slice(-2);
+    }
+
+    function padTime(t) {
+      if (!t) return '';
+      var p = t.split(':');
+      if (p.length === 2) {
+        return ('0' + p[0]).slice(-2) + ':' + ('0' + p[1]).slice(-2);
+      }
+      return t;
+    }
+
+    function showToast(msg, isError) {
+      var toast = document.getElementById('toast');
+      if (!toast) return;
+      toast.innerText = msg;
+      toast.style.background = isError ? '#dc2626' : '#059669';
+      toast.classList.add('show');
+      setTimeout(function() { toast.classList.remove('show'); }, 2200);
+    }
+
+    function switchTab(tab) {
+      var tabs = ['control', 'timetable'];
+      for (var i = 0; i < tabs.length; i++) {
+        var t = tabs[i];
+        var cap = t.charAt(0).toUpperCase() + t.slice(1);
+        var contentEl = document.getElementById('tabContent' + cap);
+        if (contentEl) contentEl.style.display = (t === tab) ? 'block' : 'none';
+        var btnEl = document.getElementById('tabBtn' + cap);
+        if (btnEl) btnEl.className = 'tab-btn' + (t === tab ? ' active' : '');
+      }
+
+      if (tab === 'timetable') { loadBadges(); loadTimetableList(); }
+      if (tab === 'control') fetchState();
+    }
+    
+    function toggleNewBadgeSelect() {
+      var type = document.getElementById('ttType').value;
+      document.getElementById('newBadgeGroup').style.display = (type === 'song' || type === 'ステージ（演奏・企画）') ? 'block' : 'none';
+    }
+    function toggleEditBadgeSelect(id) {
+      var type = document.getElementById('tt-t-'+id).value;
+      var box = document.getElementById('tt-b-box-'+id);
+      if(box) box.style.display = (type === 'song' || type === 'ステージ（演奏・企画）') ? 'block' : 'none';
+    }
+
+    function openBadgeModal() {
+      document.getElementById('badgeModal').classList.add('active');
+      loadManageBadges();
+    }
+    function closeBadgeModal() {
+      document.getElementById('badgeModal').classList.remove('active');
+    }
+
+    async function loadBadges() {
+      try {
+        var res = await fetch(API_BASE + '/api/badges');
+        gBadges = await res.json();
+        var badgeSelect = document.getElementById('ttBadge');
+        if (badgeSelect) {
+          badgeSelect.innerHTML = gBadges.map(b => '<option value="'+escapeHtml(b.name)+'">'+escapeHtml(b.name)+'</option>').join('');
+        }
+      } catch (e) { console.error("バッジ取得エラー:", e); }
+    }
+
+    async function loadManageBadges() {
+      try {
+        var res = await fetch(API_BASE + '/api/badges');
+        gBadges = await res.json();
+        var listEl = document.getElementById('badgeList');
+        if (gBadges.length === 0) { listEl.innerHTML = '<p style="color:#64748b;">登録されていません</p>'; return; }
+        listEl.innerHTML = '';
+        gBadges.forEach(function(b) {
+          listEl.innerHTML += '<div class="item-card" style="display:flex; justify-content:space-between; align-items:center; padding:10px 14px;">' +
+            '<span style="font-weight:bold; color:#00FFCC;">' + escapeHtml(b.name) + '</span>' +
+            '<button class="btn btn-danger" onclick="deleteBadge(' + b.id + ')">削除</button></div>';
+        });
+      } catch (e) {}
+    }
+
+    async function addBadge() {
+      var name = document.getElementById('newBadgeName').value.trim();
+      if (!name) return;
+      try {
+        await fetch(API_BASE + '/api/badges', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: name }) });
+        document.getElementById('newBadgeName').value = '';
+        showToast("🏷️ 追加しました", false);
+        loadManageBadges();
+        loadBadges();
+        loadTimetableList();
+      } catch (e) { showToast("❌ 通信エラー", true); }
+    }
+
+    async function deleteBadge(id) {
+      if (!confirm("このバッジを削除しますか？")) return;
+      try {
+        await fetch(API_BASE + '/api/badges/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: id }) });
+        showToast("🗑️ 削除しました", false);
+        loadManageBadges();
+        loadBadges();
+        loadTimetableList();
+      } catch (e) { showToast("❌ 通信エラー", true); }
+    }
+
+    // --- 手動進行コントロール ---
+    async function fetchState() {
+      try {
+        var res = await fetch(API_BASE + '/api/state');
+        var data = await res.json();
+        gState = data.state || { current_index: -1, is_auto: 0, wait_cm: 0, current_day: 1, delay_minutes: 0 };
+        gTimetable = data.timetable || [];
+
+        var delay = gState.delay_minutes || 0;
+        var globalBadge = document.getElementById('globalDelayBadge');
+        if (globalBadge) {
+          if (delay > 0) {
+            globalBadge.innerText = "🚨 ＋" + delay + "分 遅延中";
+            globalBadge.style.display = "block";
+          } else {
+            globalBadge.style.display = "none";
+          }
+        }
+
+        var delayLbl = document.getElementById('currentDelayLabel');
+        if (delayLbl) {
+          delayLbl.innerText = delay > 0 ? "＋" + delay + "分 遅延中" : "遅延なし (0分)";
+          delayLbl.style.color = delay > 0 ? "#ea580c" : "#94a3b8";
+        }
+        
+        var customInput = document.getElementById('customDelayInput');
+        if (customInput && document.activeElement !== customInput) {
+          customInput.value = delay;
+        }
+
+        var btn1 = document.getElementById('btnCtrlDay1');
+        var btn2 = document.getElementById('btnCtrlDay2');
+        if (gState.current_day === 1) {
+          btn1.className = 'btn'; btn1.style.background = '#2563eb';
+          btn2.className = 'btn btn-secondary'; btn2.style.background = '#475569';
+        } else {
+          btn2.className = 'btn'; btn2.style.background = '#2563eb';
+          btn1.className = 'btn btn-secondary'; btn1.style.background = '#475569';
+        }
+
+        renderControlUI();
+        if (document.getElementById('tabContentTimetable').style.display === 'block') {
+          renderTimetableList();
+        }
+      } catch (e) {}
+    }
+
+    async function setDelay(min) {
+      try {
+        var num = parseInt(min) || 0;
+        await fetch(API_BASE + '/api/state/update', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ delay_minutes: num })
+        });
+        showToast(num > 0 ? "⏱️ 遅延を +" + num + "分 に設定しました" : "⏱️ 遅延を解除しました", false);
+        fetchState();
+      } catch (e) { showToast("❌ 通信エラー", true); }
+    }
+
+    function submitCustomDelay() {
+      var val = document.getElementById('customDelayInput').value;
+      setDelay(val);
+    }
+    
+    function autoSaveDelay() {
+      if (delayInputTimer) clearTimeout(delayInputTimer);
+      delayInputTimer = setTimeout(function() {
+        submitCustomDelay();
+      }, 1500);
+    }
+
+    async function changeCurrentDay(d) {
+      if (gState.current_day === d) return;
+      if (!confirm(d + "日目に切り替えますか？\\n※進行状況はリセットされます")) return;
+      
+      try {
+        await fetch(API_BASE + '/api/state/update', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ current_day: Number(d), current_index: -1, is_auto: 0 })
+        });
+        showToast(d + "日目に切り替えました", false);
+        fetchState();
+      } catch(e) { showToast("❌ 通信エラー", true); }
+    }
+
+    async function jumpToIndex(idx) {
+      await fetch(API_BASE + '/api/state/update', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ current_index: idx, is_auto: 0 })
+      });
+      fetchState();
+    }
+
+    async function manualChange(dir) {
+      var newIdx = gState.current_index + dir;
+      if (newIdx < -1) newIdx = -1;
+      if (gTimetable && newIdx >= gTimetable.length) newIdx = gTimetable.length - 1;
+      
+      await fetch(API_BASE + '/api/state/update', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ current_index: newIdx, is_auto: 0 })
+      });
+      showToast(dir > 0 ? "▶ 次の演目を送出しました" : "◀ 前の演目に戻しました", false);
+      fetchState();
+    }
+
+    function renderControlUI() {
+      if (!gState) return;
+      var idx = gState.current_index;
+      var delay = gState.delay_minutes || 0;
+      
+      var elPrev = document.getElementById('ctrl-prev-title');
+      if (elPrev) {
+        if (idx > 0 && gTimetable && gTimetable[idx - 1]) {
+          var pItem = gTimetable[idx - 1];
+          var pS = padTime(pItem.start_time), pE = padTime(pItem.end_time);
+          var tStr = delay > 0 ? pS + "(<span style='color:#fb923c'>" + addMinutes(pS, delay) + "</span>) 〜 " + pE + "(<span style='color:#fb923c'>" + addMinutes(pE, delay) + "</span>)" : pS + " 〜 " + pE;
+          elPrev.innerHTML = tStr + " | " + escapeHtml(pItem.title || pItem.band || '無題');
+        } else { elPrev.innerText = "なし"; }
+      }
+
+      var elCurr = document.getElementById('ctrl-curr-title');
+      var elSub = document.getElementById('ctrl-curr-sub');
+      if (elCurr) {
+        if (idx >= 0 && gTimetable && gTimetable[idx]) {
+          var item = gTimetable[idx];
+          var isSong = (item.type === 'song' || item.type === 'ステージ（演奏・企画）');
+          var typeLabel = isSong ? '【ステージ】' : '【幕間CM】';
+          var displayMain = item.title || item.band || '無題';
+          elCurr.innerText = typeLabel + " " + displayMain;
+          if (elSub) {
+            var cS = padTime(item.start_time), cE = padTime(item.end_time);
+            var tStrC = delay > 0 ? cS + "(<span style='color:#fb923c'>" + addMinutes(cS, delay) + "</span>) 〜 " + cE + "(<span style='color:#fb923c'>" + addMinutes(cE, delay) + "</span>)" : cS + " 〜 " + cE;
+            elSub.innerHTML = tStrC + (item.band && item.title ? " | " + escapeHtml(item.band) : "");
+          }
+        } else {
+          elCurr.innerText = "待機中・CM放映中";
+          if (elSub) elSub.innerText = "「次へ送出」を押すと1番目の演目を開始します";
+        }
+      }
+
+      var elNext = document.getElementById('ctrl-next-title');
+      if (elNext) {
+        if (gTimetable && idx + 1 < gTimetable.length && gTimetable[idx + 1]) {
+          var nItem = gTimetable[idx + 1];
+          var nS = padTime(nItem.start_time), nE = padTime(nItem.end_time);
+          var tStrN = delay > 0 ? nS + "(<span style='color:#fb923c'>" + addMinutes(nS, delay) + "</span>) 〜 " + nE + "(<span style='color:#fb923c'>" + addMinutes(nE, delay) + "</span>)" : nS + " 〜 " + nE;
+          elNext.innerHTML = tStrN + " | " + escapeHtml(nItem.title || nItem.band || '無題');
+        } else { elNext.innerText = "なし（全演目終了）"; }
+      }
+
+      var listEl = document.getElementById('ctrl-timetable-list');
+      if (listEl && gTimetable) {
+        listEl.innerHTML = '';
+        gTimetable.forEach(function(item, i) {
+          var card = document.createElement('div');
+          card.className = 'ctrl-item-card ' + (i === idx ? 'active' : '');
+          card.onclick = function() {
+            if (confirm("「" + (item.title || item.band || '演目') + "」へ直接切り替えますか？")) {
+              jumpToIndex(i);
+            }
+          };
+          var isSong = (item.type === 'song' || item.type === 'ステージ（演奏・企画）');
+          var lS = padTime(item.start_time), lE = padTime(item.end_time);
+          var tStrL = delay > 0 ? lS + "(<span style='color:#fb923c'>" + addMinutes(lS, delay) + "</span>) 〜 " + lE + "(<span style='color:#fb923c'>" + addMinutes(lE, delay) + "</span>)" : lS + " 〜 " + lE;
+          
+          card.innerHTML = 
+            '<div class="ctrl-item-row"><span class="ctrl-time">🕒 ' + tStrL + '</span>' +
+            (isSong ? '<span class="tag tag-song" style="font-size:11px;background:#059669;color:white;padding:2px 6px;border-radius:4px;">ステージ</span>' : '<span class="tag tag-break" style="font-size:11px;background:#d97706;color:white;padding:2px 6px;border-radius:4px;">幕間CM</span>') + '</div>' +
+            '<div class="ctrl-title">' + escapeHtml(item.title || item.band || '無題') + '</div>' +
+            (item.band && item.title ? '<div class="ctrl-band">' + escapeHtml(item.band) + '</div>' : '');
+          listEl.appendChild(card);
+        });
+      }
+    }
+
+    setInterval(function() {
+      var ctrlBox = document.getElementById('tabContentControl');
+      if (ctrlBox && ctrlBox.style.display !== 'none') fetchState();
+    }, 2000);
+
+    // --- タイムテーブル管理 ---
+    function setEditDay(day) {
+      currentEditDay = day;
+      var btn1 = document.getElementById('btnEditDay1');
+      var btn2 = document.getElementById('btnEditDay2');
+      if (day === 1) {
+        btn1.className = 'btn'; btn1.style.background = '#2563eb';
+        btn2.className = 'btn btn-secondary'; btn2.style.background = '#475569';
+      } else {
+        btn2.className = 'btn'; btn2.style.background = '#2563eb';
+        btn1.className = 'btn btn-secondary'; btn1.style.background = '#475569';
+      }
+      document.getElementById('txtEditDayLabel').innerText = day + "日目";
+      document.getElementById('txtListDayLabel').innerText = day + "日目";
+      document.getElementById('lblDelModalDay').innerText = day + "日目";
+      document.getElementById('lblImpModalDay').innerText = day + "日目";
+      renderTimetableList();
+    }
+
+    async function submitTimetable() {
+      var startTime = padTime(document.getElementById('ttStart').value);
+      var endTime = padTime(document.getElementById('ttEnd').value);
+      var title = document.getElementById('ttTitle').value.trim();
+      var band = document.getElementById('ttBand').value.trim();
+      var type = document.getElementById('ttType').value;
+      var badge = document.getElementById('ttBadge').value;
+
+      try {
+        var res = await fetch(API_BASE + '/api/timetable', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ day: currentEditDay, start_time: startTime, end_time: endTime, title: title, band: band, type: type, badge: badge })
+        });
+        var data = await res.json();
+        if (res.ok) {
+          showToast("📅 追加しました！", false);
+          document.getElementById('ttTitle').value = ''; document.getElementById('ttBand').value = '';
+          loadTimetableList();
+        } else { showToast("❌ " + (data.error || "追加失敗"), true); }
+      } catch (err) { showToast("❌ 通信エラー", true); }
+    }
+
+    async function loadTimetableList() {
+      try {
+        var res = await fetch(API_BASE + '/api/timetable');
+        gAllTimetable = await res.json();
+        if (gAllTimetable.error) return;
+        renderTimetableList();
+      } catch (e) {}
+    }
+
+    function renderTimetableList() {
+      var listEl = document.getElementById('timetableList');
+      if (!listEl) return;
+      var items = gAllTimetable.filter(function(i) { return i.day === currentEditDay; });
+
+      if (items.length === 0) {
+        listEl.innerHTML = '<div style="text-align:center; color:#64748b;">' + currentEditDay + '日目の登録はありません</div>';
+        return;
+      }
+      listEl.innerHTML = '';
+      
+      var badgeOptionsHtml = gBadges.map(b => '<option value="'+escapeHtml(b.name)+'">'+escapeHtml(b.name)+'</option>').join('');
+      var delay = gState.delay_minutes || 0;
+
+      items.forEach(function(item) {
+        var card = document.createElement('div');
+        card.className = 'item-card ' + ((item.type === 'song' || item.type === 'ステージ（演奏・企画）') ? 'item-song' : 'item-break');
+        var isSong = (item.type === 'song' || item.type === 'ステージ（演奏・企画）');
+        
+        var currentBadgeOptions = badgeOptionsHtml;
+        if (item.badge && !gBadges.some(b => b.name === item.badge)) {
+          currentBadgeOptions += '<option value="'+escapeHtml(item.badge)+'">'+escapeHtml(item.badge)+'</option>';
+        }
+        currentBadgeOptions = currentBadgeOptions.replace('value="'+escapeHtml(item.badge||'')+'"', 'value="'+escapeHtml(item.badge||'')+'" selected');
+
+        var sOrig = padTime(item.start_time);
+        var eOrig = padTime(item.end_time);
+        
+        var sLabel = delay > 0 ? '開始時刻 <span style="color:#fb923c; font-weight:bold;">(' + addMinutes(sOrig, delay) + ')</span>' : '開始時刻';
+        var eLabel = delay > 0 ? '終了時刻 <span style="color:#fb923c; font-weight:bold;">(' + addMinutes(eOrig, delay) + ')</span>' : '終了時刻';
+
+        card.innerHTML = 
+          '<div class="item-header"><div style="display:flex; gap:8px; align-items:flex-end; flex-wrap:wrap;">' +
+            '<div><div style="font-size:11px; color:#94a3b8; margin-bottom:2px;">' + sLabel + '</div><input type="time" id="tt-s-'+item.id+'" value="'+sOrig+'" style="width:110px;"></div><span style="margin-bottom:8px;">〜</span>' +
+            '<div><div style="font-size:11px; color:#94a3b8; margin-bottom:2px;">終了時刻</div><input type="time" id="tt-e-'+item.id+'" value="'+eOrig+'" style="width:110px;"></div>' +
+            '<div><div style="font-size:11px; color:#94a3b8; margin-bottom:2px;">種別</div><select id="tt-t-'+item.id+'" style="width:120px;" onchange="toggleEditBadgeSelect('+item.id+')">' +
+              '<option value="song"'+(isSong?' selected':'')+'>ステージ</option>' +
+              '<option value="break"'+((!isSong)?' selected':'')+'>幕間CM</option>' +
+            '</select></div>' +
+            '<div id="tt-b-box-'+item.id+'" style="'+(!isSong ? 'display:none;' : '')+'"><div style="font-size:11px; color:#94a3b8; margin-bottom:2px;">バッジ</div><select id="tt-b-'+item.id+'" style="width:120px;">' +
+              currentBadgeOptions +
+            '</select></div>' +
+          '</div></div>' +
+          '<div style="display:flex; gap:8px; margin-top:8px;">' +
+            '<div style="flex:1;"><div style="font-size:11px; color:#94a3b8; margin-bottom:2px;">団体名</div><input type="text" id="tt-band-'+item.id+'" value="'+escapeHtml(item.band||'')+'" placeholder="団体名"></div>' +
+            '<div style="flex:2;"><div style="font-size:11px; color:#94a3b8; margin-bottom:2px;">詳細（企画名・タイトル）</div><input type="text" id="tt-title-'+item.id+'" value="'+escapeHtml(item.title||'')+'" placeholder="詳細（企画名・タイトル）"></div>' +
+          '</div>' +
+          '<div style="display:flex; justify-content:flex-end; gap:8px; margin-top:10px;">' +
+            '<button class="btn btn-save" onclick="updateTimetable('+item.id+', this)">変更保存</button>' +
+            '<button class="btn btn-danger" onclick="deleteTimetable('+item.id+')">削除</button>' +
+          '</div>';
+        listEl.appendChild(card);
+      });
+    }
+
+    async function updateTimetable(id, btn) {
+      if (btn) { btn.disabled = true; btn.innerText = "保存中..."; }
+      try {
+        var badgeVal = document.getElementById('tt-b-'+id) ? document.getElementById('tt-b-'+id).value : 'ステージ';
+        var res = await fetch(API_BASE + '/api/timetable/update', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: id, day: currentEditDay, start_time: document.getElementById('tt-s-'+id).value, end_time: document.getElementById('tt-e-'+id).value, type: document.getElementById('tt-t-'+id).value, title: document.getElementById('tt-title-'+id).value, band: document.getElementById('tt-band-'+id).value, badge: badgeVal })
+        });
+        var data = await res.json();
+        if (res.ok) { showToast("✅ 更新しました", false); loadTimetableList(); }
+        else { showToast("❌ " + data.error, true); if(btn){btn.disabled=false;btn.innerText="変更保存";} }
+      } catch (e) { showToast("❌ 通信エラー", true); if(btn){btn.disabled=false;btn.innerText="変更保存";} }
+    }
+
+    async function deleteTimetable(id) {
+      if (!confirm("削除しますか？")) return;
+      await fetch(API_BASE + '/api/timetable/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: id }) });
+      showToast("🗑️ 削除しました", false); loadTimetableList();
+    }
+
+    function openDeleteRangeModal() { document.getElementById('deleteRangeModal').classList.add('active'); }
+    function closeDeleteRangeModal() { document.getElementById('deleteRangeModal').classList.remove('active'); }
+
+    async function executeDeleteRange() {
+      var start = padTime(document.getElementById('delStartTime').value);
+      var end = padTime(document.getElementById('delEndTime').value);
+      if (!start || !end || start >= end) return alert("正しい時刻を指定してください");
+      if (!confirm("【" + currentEditDay + "日目】 " + start + " 〜 " + end + " をすべて削除しますか？")) return;
+
+      try {
+        var res = await fetch(API_BASE + '/api/timetable/delete_range', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ day: currentEditDay, start_time: start, end_time: end })
+        });
+        var data = await res.json();
+        if (res.ok) { showToast("🗑️ 削除しました", false); closeDeleteRangeModal(); loadTimetableList(); }
+        else { showToast("❌ 削除失敗: " + data.error, true); }
+      } catch (e) { showToast("❌ 通信エラー", true); }
+    }
+
+    function openImportModal() { document.getElementById('importModal').classList.add('active'); document.getElementById('importRawText').focus(); }
+    function closeImportModal() { document.getElementById('importModal').classList.remove('active'); }
+
+    function parseImportText() {
+      var text = document.getElementById('importRawText').value;
+      var tbody = document.getElementById('importPreviewBody');
+      var btnExecute = document.getElementById('btnExecuteImport');
+      parsedBatchItems = [];
+
+      if (!text.trim()) { tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;">プレビューが表示されます</td></tr>'; btnExecute.disabled = true; return; }
+
+      var rawLines = text.split('\\n');
+      var parsed = [];
+      for (var i = 0; i < rawLines.length; i++) {
+        var line = rawLines[i].trim();
+        if (!line) continue;
+        var cols = (line.indexOf('\\t') !== -1) ? line.split('\\t') : line.split(',');
+        var startTime = padTime((cols[0] || '').trim()), endTime = padTime((cols[1] || '').trim());
+        var band = (cols[2] || '').trim();
+        var title = (cols[3] || '').trim();
+        var type = ((cols[4] || '').indexOf('幕間') !== -1 || (cols[4] || '').indexOf('CM') !== -1) ? 'break' : 'song';
+        var badge = (cols[5] || '').trim() || 'ステージ';
+        
+        var isSong = (type === 'song');
+        if (!isSong && !title) title = '幕間CM';
+        if (!title && band) title = band;
+
+        var error = (!startTime || !endTime) ? '時刻不正' : (startTime >= endTime ? '時間逆転' : '');
+        parsed.push({ idx: parsed.length + 1, start_time: startTime, end_time: endTime, title: title, band: band, type: type, badge: badge, error: error });
+      }
+
+      for (var aIdx = 0; aIdx < parsed.length; aIdx++) {
+        for (var bIdx = aIdx + 1; bIdx < parsed.length; bIdx++) {
+          if (!parsed[aIdx].error && !parsed[bIdx].error && parsed[aIdx].start_time < parsed[bIdx].end_time && parsed[aIdx].end_time > parsed[bIdx].start_time) {
+            parsed[aIdx].error = '行' + parsed[bIdx].idx + 'と重複'; parsed[bIdx].error = '行' + parsed[aIdx].idx + 'と重複';
+          }
+        }
+      }
+
+      var errorCount = 0, rowsHtml = '';
+      parsed.forEach(function(p) {
+        if (p.error) errorCount++;
+        rowsHtml += '<tr class="'+(p.error?'has-error':'')+'"><td>'+p.start_time+'</td><td>'+p.end_time+'</td><td>'+escapeHtml(p.band)+'</td><td>'+escapeHtml(p.title)+'</td><td>'+(p.type==='song'?'ステージ':'幕間')+'</td><td>'+escapeHtml(p.badge)+'</td><td>'+(p.error?'❌ '+p.error:'✅ OK')+'</td></tr>';
+      });
+      tbody.innerHTML = rowsHtml;
+      document.getElementById('importStats').innerText = "解析結果: " + parsed.length + " 件" + (errorCount > 0 ? " (エラー: " + errorCount + ")" : "");
+
+      if (errorCount > 0 || parsed.length === 0) { btnExecute.disabled = true; btnExecute.innerText = 'エラーを修正してください'; }
+      else {
+        btnExecute.disabled = false; btnExecute.innerText = currentEditDay + ' 日目に一括インポート';
+        parsedBatchItems = parsed;
+      }
+    }
+
+    async function executeBatchImport() {
+      if (parsedBatchItems.length === 0) return;
+      var overwrite = document.getElementById('importOverwrite').checked;
+      if (overwrite && !confirm("【確認】" + currentEditDay + "日目の既存データをすべて削除しますか？")) return;
+
+      document.getElementById('btnExecuteImport').disabled = true;
+      try {
+        var res = await fetch(API_BASE + '/api/timetable/batch', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ items: parsedBatchItems, overwrite: overwrite, day: currentEditDay })
+        });
+        var data = await res.json();
+        if (res.ok) { showToast('🎉 一括登録完了！', false); closeImportModal(); loadTimetableList(); }
+        else { showToast('❌ インポート失敗: ' + data.error, true); document.getElementById('btnExecuteImport').disabled = false; }
+      } catch (err) { showToast('❌ 通信エラー', true); document.getElementById('btnExecuteImport').disabled = false; }
+    }
+
+    function escapeHtml(str) { return (str || '').replace(/[&<>'"]/g, function(t) { return {'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[t] || t; }); }
+
+    loadBadges().then(() => setEditDay(1));
+    switchTab('control');
+  </script>
+</body>
+</html>
+`
+
+export default app
